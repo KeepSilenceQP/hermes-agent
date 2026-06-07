@@ -19276,10 +19276,11 @@ class GatewayRunner:
         # When card streaming is active, finalize the card before deciding
         # whether the caller should skip its normal send().
         _card_sink = feishu_card_sink_holder[0] if feishu_card_sink_holder else None
+        _final_raw = response.get("final_response") if isinstance(response, dict) else None
+        _is_empty_sentinel = not _final_raw or _final_raw == "(empty)"
 
         if _card_sink is not None and isinstance(response, dict) and not response.get("failed"):
-            _final = response.get("final_response") or ""
-            _is_empty_sentinel = not _final or _final == "(empty)"
+            _final = _final_raw or ""
             if _is_empty_sentinel:
                 # Empty response — let the normal path handle it.
                 pass
@@ -19323,7 +19324,6 @@ class GatewayRunner:
         _sc = stream_consumer_holder[0]
         if isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""
-            _is_empty_sentinel = not _final or _final == "(empty)"
             _streamed = bool(
                 _sc and getattr(_sc, "final_response_sent", False)
             )
