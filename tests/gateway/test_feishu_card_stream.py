@@ -121,6 +121,64 @@ def test_sink_delta_schedules_update_before_finalize():
     asyncio.run(run())
 
 
+def test_sink_continues_updates_for_deltas_queued_during_flush():
+    class SlowUpdateAdapter(_FakeFeishuCardAdapter):
+        def __init__(self):
+            super().__init__()
+            self.first_update_started = asyncio.Event()
+
+        async def update_card_stream_message(self, update_handle, card, sequence=None):
+            self.updated.append((update_handle, card, sequence))
+            if len(self.updated) == 1:
+                self.first_update_started.set()
+                await asyncio.sleep(0.01)
+            return SimpleNamespace(success=True)
+
+    async def run():
+        adapter = SlowUpdateAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        sink.on_delta("one")
+        await sink.drain_pending_updates()
+        assert adapter.created
+
+        sink.on_delta(" two")
+        await adapter.first_update_started.wait()
+        sink.on_delta(" three")
+        await sink.drain_pending_updates()
+
+        assert len(adapter.updated) >= 2
+        assert "one two three" in str(adapter.updated[-1][1])
+
+    asyncio.run(run())
+
+
+def test_sink_finalize_replaces_compact_streamed_block_with_final_text():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        compact = "流式卡片验证****当前时间： 2026-06-08 当前运行状态- 平台：Feishu 总结：完成。"
+        final_text = (
+            "流式卡片验证\n\n"
+            "**当前时间：** 2026-06-08\n\n"
+            "**当前运行状态**\n"
+            "- 平台：Feishu\n\n"
+            "**总结：** 完成。"
+        )
+        sink.on_delta(compact)
+        await sink.drain_pending_updates()
+
+        delivered = await sink.finalize(final_text)
+
+        assert delivered is True
+        rendered_content = adapter.updated[-1][1]["body"]["elements"][0]["content"]
+        assert rendered_content == final_text
+        assert compact not in str(adapter.updated[-1][1])
+
+    asyncio.run(run())
+
+
 def test_sink_tool_progress_schedules_update_before_finalize():
     async def run():
         adapter = _FakeFeishuCardAdapter()

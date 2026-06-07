@@ -168,13 +168,16 @@ class FeishuCardRunSink:
             self._drain_task = asyncio.create_task(self._drain_and_flush())
 
     async def _drain_and_flush(self) -> None:
-        if self.update_interval_sec > 0:
-            await asyncio.sleep(self.update_interval_sec)
-        changed = self._drain_events()
-        if changed and not self.card_updates_disabled:
-            ok = await self.flush()
-            if not ok:
-                self._record_update_failure()
+        while not self._closed:
+            if self.update_interval_sec > 0:
+                await asyncio.sleep(self.update_interval_sec)
+            changed = self._drain_events()
+            if changed and not self.card_updates_disabled:
+                ok = await self.flush()
+                if not ok:
+                    self._record_update_failure()
+            if self._event_queue.empty():
+                return
 
     def _drain_events(self) -> bool:
         changed = False
@@ -304,16 +307,10 @@ class FeishuCardRunSink:
         self._closed = True
         await self.drain_pending_updates()
         self._flush_text_filter_pending()
-        # Append final_text as a new block rather than replacing accumulated
-        # streaming text, so any tool commentary / intermediate content
-        # the user saw during streaming remains visible in the card.
         if final_text:
             cleaned = clean_stream_display_text(final_text)
             if cleaned:
-                if self.state.text_blocks and cleaned.startswith(self.state.text_blocks[-1]):
-                    self.state.text_blocks[-1] = cleaned
-                else:
-                    self.state.text_blocks.append(cleaned)
+                self.state.text_blocks = [cleaned]
         self.state.finalize()
         if await self.flush():
             self.final_response_sent = True
