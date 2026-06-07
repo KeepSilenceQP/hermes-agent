@@ -1518,6 +1518,47 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _should_use_feishu_card_streaming(*, platform_key: str, user_config: dict) -> bool:
+    """Return True when Feishu card-streaming is enabled for this platform."""
+    if platform_key != "feishu":
+        return False
+    display = user_config.get("display") if isinstance(user_config, dict) else {}
+    platforms = display.get("platforms") if isinstance(display, dict) else {}
+    feishu = platforms.get("feishu") if isinstance(platforms, dict) else {}
+    return bool(feishu.get("card_streaming")) if isinstance(feishu, dict) else False
+
+
+def _card_sink_delivered_final(sink: object | None) -> bool:
+    """Return True when the card sink has already delivered the final response."""
+    if sink is None:
+        return False
+    return bool(
+        getattr(sink, "final_response_sent", False)
+        or getattr(sink, "final_content_delivered", False)
+        or getattr(sink, "fallback_sent", False)
+    )
+
+
+def _should_attach_tool_progress_callback(*, tool_progress_enabled: bool, want_feishu_card_streaming: bool) -> bool:
+    """Keep the tool-progress callback attached when card streaming needs it."""
+    return bool(tool_progress_enabled or want_feishu_card_streaming)
+
+
+def _should_attach_interim_callback(*, want_interim_messages: bool, want_feishu_card_streaming: bool) -> bool:
+    """Keep the interim-assistant callback attached when card streaming needs it."""
+    return bool(want_interim_messages or want_feishu_card_streaming)
+
+
+def _should_create_gateway_stream_consumer(
+    *,
+    streaming_enabled: bool,
+    want_interim_messages: bool,
+    want_feishu_card_streaming: bool,
+) -> bool:
+    """Return True when a GatewayStreamConsumer should be created (not used with card streaming)."""
+    return bool((streaming_enabled or want_interim_messages) and not want_feishu_card_streaming)
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -17124,6 +17165,10 @@ class GatewayRunner:
 
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
+            # Route tool progress through the Feishu card sink when active.
+            if _want_feishu_card_streaming and feishu_card_sink_holder[0] is not None:
+                feishu_card_sink_holder[0].on_tool_progress(event_type, tool_name, preview, args, **kwargs)
+                return
             if not progress_queue or not _run_still_current():
                 return
 
@@ -17591,7 +17636,8 @@ class GatewayRunner:
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
         stream_consumer_holder = [None]  # Mutable container for stream consumer
-        
+        feishu_card_sink_holder = [None]  # Mutable container for Feishu card sink
+
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
         _hooks_ref = self.hooks
@@ -17754,7 +17800,33 @@ class GatewayRunner:
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
-            if _want_stream_deltas or _want_interim_consumer:
+            _want_feishu_card_streaming = _should_use_feishu_card_streaming(
+                platform_key=platform_key,
+                user_config=user_config,
+            )
+            if _want_feishu_card_streaming:
+                # When Feishu card streaming is active, skip the regular
+                # GatewayStreamConsumer and wire agent callbacks through the
+                # FeishuCardRunSink instead.
+                _stream_consumer = None
+                _stream_delta_cb = None
+                try:
+                    from gateway.platforms.feishu_card_stream import FeishuCardRunSink
+                    _feishu_adapter = self.adapters.get(Platform.FEISHU)
+                    if _feishu_adapter:
+                        feishu_card_sink_holder[0] = FeishuCardRunSink(
+                            adapter=_feishu_adapter,
+                            chat_id=source.chat_id,
+                            metadata=_status_thread_metadata,
+                            reply_to=event_message_id,
+                        )
+                except Exception as _card_err:
+                    logger.debug("Could not set up Feishu card sink: %s", _card_err)
+            if _should_create_gateway_stream_consumer(
+                streaming_enabled=_want_stream_deltas,
+                want_interim_messages=_want_interim_consumer,
+                want_feishu_card_streaming=_want_feishu_card_streaming,
+            ):
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
@@ -17813,8 +17885,20 @@ class GatewayRunner:
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
 
+            # When Feishu card streaming is active but no GatewayStreamConsumer
+            # was created (the try block above was skipped), wire a card-sink
+            # stream delta callback instead.
+            if _want_feishu_card_streaming and _stream_delta_cb is None and feishu_card_sink_holder[0] is not None:
+                def _stream_delta_cb(text: str) -> None:
+                    if _run_still_current():
+                        feishu_card_sink_holder[0].on_delta(text)
+
             def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
                 if not _run_still_current():
+                    return
+                # Route interim commentary through the Feishu card sink when active.
+                if _want_feishu_card_streaming and feishu_card_sink_holder[0] is not None:
+                    feishu_card_sink_holder[0].on_commentary(text)
                     return
                 if _stream_consumer is not None:
                     if already_streamed:
@@ -17909,7 +17993,10 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if tool_progress_enabled else None
+            agent.tool_progress_callback = progress_callback if _should_attach_tool_progress_callback(
+                tool_progress_enabled=tool_progress_enabled,
+                want_feishu_card_streaming=_want_feishu_card_streaming,
+            ) else None
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (
@@ -17917,7 +18004,10 @@ class GatewayRunner:
             )
             agent.step_callback = _step_callback_sync if _hooks_ref.loaded_hooks else None
             agent.stream_delta_callback = _stream_delta_cb
-            agent.interim_assistant_callback = _interim_assistant_cb if _want_interim_messages else None
+            agent.interim_assistant_callback = _interim_assistant_cb if _should_attach_interim_callback(
+                want_interim_messages=_want_interim_messages,
+                want_feishu_card_streaming=_want_feishu_card_streaming,
+            ) else None
             agent.status_callback = _status_callback_sync
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
@@ -19181,6 +19271,42 @@ class GatewayRunner:
                         await task
                     except asyncio.CancelledError:
                         pass
+
+        # --- Feishu card sink finalization ---------------------------------
+        # When card streaming is active, finalize the card before deciding
+        # whether the caller should skip its normal send().
+        _card_sink = feishu_card_sink_holder[0] if feishu_card_sink_holder else None
+        _card_delivered = _card_sink_delivered_final(_card_sink)
+
+        if _card_sink is not None and isinstance(response, dict) and not response.get("failed"):
+            _final = response.get("final_response") or ""
+            _is_empty_sentinel = not _final or _final == "(empty)"
+            if _is_empty_sentinel:
+                # Empty response — let the normal path handle it.
+                pass
+            elif response.get("response_transformed"):
+                try:
+                    if await _card_sink.update_final_after_transform(_final):
+                        response["already_sent"] = True
+                except Exception as _card_err:
+                    logger.warning("Feishu card transform update failed: %s", _card_err)
+            else:
+                try:
+                    if await _card_sink.finalize(_final):
+                        response["already_sent"] = True
+                except Exception as _card_err:
+                    logger.warning("Feishu card finalize failed: %s", _card_err)
+        elif _card_sink is not None and isinstance(response, dict) and response.get("failed"):
+            error_text = (
+                response.get("final_response")
+                or response.get("error")
+                or "Agent failed"
+            )
+            try:
+                if await _card_sink.finish_failed(error_text):
+                    response["already_sent"] = True
+            except Exception as _card_err:
+                logger.warning("Feishu card error delivery failed: %s", _card_err)
 
         # If streaming already delivered the response, mark it so the
         # caller's send() is skipped (avoiding duplicate messages).
