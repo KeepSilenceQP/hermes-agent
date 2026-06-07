@@ -185,11 +185,15 @@ class FeishuCardRunSink:
                 return changed
             changed = True
             if kind == "delta":
+                if args[0] is None:
+                    continue
                 cleaned = self.text_filter.feed(str(args[0]))
                 if cleaned:
                     cleaned = clean_stream_display_text(cleaned)
                     self.state.append_text(cleaned)
             elif kind == "commentary":
+                if args[0] is None:
+                    continue
                 cleaned = self.text_filter.feed(str(args[0]))
                 if cleaned:
                     cleaned = clean_stream_display_text(cleaned)
@@ -283,7 +287,10 @@ class FeishuCardRunSink:
             result = await self.adapter.update_card_stream_message(
                 self.update_handle, self.renderer.render(self.state), sequence=seq
             )
-            return bool(getattr(result, "success", False))
+            ok = bool(getattr(result, "success", False))
+            if not ok:
+                logger.warning("feishu_card_update_failed: %s", getattr(result, "error", None) or "unknown error")
+            return ok
 
     def _flush_text_filter_pending(self) -> None:
         """Flush any partial-tag text held by the think-block filter into state."""

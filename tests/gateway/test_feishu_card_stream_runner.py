@@ -153,6 +153,46 @@ def test_card_sink_finalize_does_not_duplicate_streamed_final_text():
     asyncio.run(run())
 
 
+def test_card_sink_ignores_none_delta_boundaries():
+    """Tool-boundary None deltas must not render as literal 'None' text."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from gateway.platforms.feishu_card_stream import FeishuCardRunSink
+
+    class _Adapter:
+        def __init__(self):
+            self.created = []
+            self.updated = []
+
+        async def create_card_stream_message(self, chat_id, card, metadata=None, reply_to=None):
+            self.created.append(card)
+            return SimpleNamespace(success=True, message_id="om_1", card_id="card_1")
+
+        async def update_card_stream_message(self, update_handle, card, sequence=None):
+            self.updated.append(card)
+            return SimpleNamespace(success=True)
+
+        async def send(self, chat_id, content, metadata=None, reply_to=None):
+            return SimpleNamespace(success=True, message_id="om_fb")
+
+    async def run():
+        adapter = _Adapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_test", update_interval_sec=0)
+
+        sink.on_delta(None)
+        sink.on_delta(None)
+        sink.on_delta("visible answer")
+        sink.on_delta(None)
+        await sink.drain_pending_updates()
+
+        rendered = str(adapter.created[-1])
+        assert "visible answer" in rendered
+        assert "None" not in rendered
+
+    asyncio.run(run())
+
+
 def test_card_sink_callback_routing_tool_progress():
     """Tool progress events route through sink and appear in card."""
     import asyncio

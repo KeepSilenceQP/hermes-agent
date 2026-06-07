@@ -2066,7 +2066,12 @@ class FeishuAdapter(BasePlatformAdapter):
             request.card_id(update_handle)
             request.request_body(update_body.build())
             response = await self._client.cardkit.v1.card.aupdate(request.build())
-            return response.success() if hasattr(response, "success") else response.code == 0
+            ok = response.success() if hasattr(response, "success") else response.code == 0
+            if not ok:
+                code = getattr(response, "code", None)
+                msg = getattr(response, "msg", None) or getattr(response, "message", None)
+                logger.warning("[Feishu] card update response failed: code=%s msg=%s", code, msg)
+            return ok
         except ImportError:
             logger.warning("[Feishu] cardkit SDK not available for update")
             return False
