@@ -265,6 +265,27 @@ def test_sink_tool_progress_schedules_update_before_finalize():
     asyncio.run(run())
 
 
+def test_sink_flush_threadsafe_updates_tool_progress_before_finalize():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=60)
+
+        await sink.start("正在处理...")
+
+        def worker():
+            sink.on_tool_progress("tool.started", tool_name="terminal", preview="pwd")
+            return sink.flush_threadsafe(timeout_sec=2)
+
+        assert await asyncio.to_thread(worker) is True
+
+        assert adapter.text_updated
+        assert "command_execution" in adapter.text_updated[-1][2]
+        assert "pwd" in adapter.text_updated[-1][2]
+        assert sink.final_response_sent is False
+
+    asyncio.run(run())
+
+
 def test_sink_accepts_delta_from_worker_thread():
     async def run():
         adapter = _FakeFeishuCardAdapter()

@@ -42,9 +42,14 @@ def test_route_feishu_card_tool_progress_calls_sink():
     class Sink:
         def __init__(self):
             self.calls = []
+            self.flushes = 0
 
         def on_tool_progress(self, event_type, tool_name, preview, args, **kwargs):
             self.calls.append((event_type, tool_name, preview, args, kwargs))
+
+        def flush_threadsafe(self):
+            self.flushes += 1
+            return True
 
     sink = Sink()
 
@@ -58,6 +63,7 @@ def test_route_feishu_card_tool_progress_calls_sink():
     assert sink.calls == [
         ("tool.started", "terminal", "pwd", {"command": "pwd"}, {})
     ]
+    assert sink.flushes == 1
 
 
 def test_route_feishu_card_tool_progress_handles_sink_error(caplog):

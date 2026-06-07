@@ -1559,6 +1559,9 @@ def _route_feishu_card_tool_progress(
         return False
     try:
         sink.on_tool_progress(event_type, tool_name, preview, args, **kwargs)
+        flush_now = getattr(sink, "flush_threadsafe", None)
+        if callable(flush_now):
+            flush_now()
         if logger_obj is not None:
             logger_obj.info(
                 "feishu_card_tool_progress_routed event=%s tool=%s",

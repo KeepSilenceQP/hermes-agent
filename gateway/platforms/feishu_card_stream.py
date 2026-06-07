@@ -5,9 +5,11 @@ import json
 import logging
 import queue
 import threading
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent.async_utils import safe_schedule_threadsafe
 from gateway.stream_text_cleaner import StreamDisplayTextFilter, clean_stream_display_text
 
 
@@ -183,6 +185,7 @@ class FeishuCardRunSink:
         self._closed = False
         self._event_queue: queue.Queue[tuple[str, tuple[Any, ...], dict[str, Any]]] = queue.Queue()
         self._drain_task: asyncio.Task[None] | None = None
+        self._drain_lock: asyncio.Lock | None = None
         self._schedule_lock = threading.Lock()
         self._flush_lock = asyncio.Lock()
         self._sequence = 0
@@ -235,17 +238,48 @@ class FeishuCardRunSink:
         if self._drain_task is None or self._drain_task.done():
             self._drain_task = asyncio.create_task(self._drain_and_flush())
 
-    async def _drain_and_flush(self) -> None:
+    def flush_threadsafe(self, *, timeout_sec: float = 2.0) -> bool:
+        if self._closed or self.card_updates_disabled or self._loop is None:
+            return False
+        try:
+            if asyncio.get_running_loop() is self._loop:
+                self._ensure_drain_task()
+                return False
+        except RuntimeError:
+            pass
+        future = safe_schedule_threadsafe(
+            self._drain_and_flush(delay=False),
+            self._loop,
+            logger=logger,
+            log_message="feishu_card_flush_threadsafe_schedule_failed",
+            log_level=logging.WARNING,
+        )
+        if future is None:
+            return False
+        try:
+            future.result(timeout=timeout_sec)
+            return True
+        except FutureTimeoutError:
+            logger.warning("feishu_card_flush_threadsafe_timeout")
+            return False
+        except Exception as exc:
+            logger.warning("feishu_card_flush_threadsafe_failed: %s", exc)
+            return False
+
+    async def _drain_and_flush(self, *, delay: bool = True) -> None:
+        if self._drain_lock is None:
+            self._drain_lock = asyncio.Lock()
         while not self._closed:
-            if self.update_interval_sec > 0:
+            if delay and self.update_interval_sec > 0:
                 await asyncio.sleep(self.update_interval_sec)
-            changed = self._drain_events()
-            if changed and not self.card_updates_disabled:
-                ok = await self.flush()
-                if not ok:
-                    self._record_update_failure()
-            if self._event_queue.empty():
-                return
+            async with self._drain_lock:
+                changed = self._drain_events()
+                if changed and not self.card_updates_disabled:
+                    ok = await self.flush()
+                    if not ok:
+                        self._record_update_failure()
+                if self._event_queue.empty():
+                    return
 
     def _drain_events(self) -> bool:
         changed = False
