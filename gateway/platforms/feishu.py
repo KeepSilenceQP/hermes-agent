@@ -2056,7 +2056,7 @@ class FeishuAdapter(BasePlatformAdapter):
             from lark_oapi.api.cardkit.v1.model.card import Card as CardKitCard
 
             update_card = CardKitCard.builder()
-            update_card.type(card.get("schema", "2.0"))
+            update_card.type("card_json")
             update_card.data(json.dumps(card))
             update_body = UpdateCardRequestBody.builder()
             update_body.card(update_card.build())

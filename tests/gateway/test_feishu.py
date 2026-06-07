@@ -5082,3 +5082,32 @@ class TestFeishuCardStreamTransport(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertIn("card update failed", result.error)
+
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark_oapi not installed")
+    def test_update_card_stream_transport_sends_card_json_type(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _CardAPI:
+            async def aupdate(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            cardkit=SimpleNamespace(v1=SimpleNamespace(card=_CardAPI()))
+        )
+        card = {
+            "schema": "2.0",
+            "body": {"elements": [{"tag": "markdown", "content": "hello"}]},
+        }
+
+        ok = asyncio.run(adapter._update_card_stream_transport("7355372766134157313", card, sequence=7))
+
+        self.assertTrue(ok)
+        body = captured["request"].body
+        self.assertEqual(body.card.type, "card_json")
+        self.assertEqual(json.loads(body.card.data), card)
+        self.assertEqual(body.sequence, 7)
