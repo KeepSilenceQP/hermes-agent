@@ -19,14 +19,13 @@ import asyncio
 import inspect
 import logging
 import queue
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
-from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
+from gateway.stream_text_cleaner import StreamDisplayTextFilter, clean_stream_display_text
 from gateway.config import (
     DEFAULT_STREAMING_EDIT_INTERVAL as _DEFAULT_STREAMING_EDIT_INTERVAL,
     DEFAULT_STREAMING_BUFFER_THRESHOLD as _DEFAULT_STREAMING_BUFFER_THRESHOLD,
@@ -95,18 +94,6 @@ class GatewayStreamConsumer:
     # progressive edits for the remainder of the stream.
     _MAX_FLOOD_STRIKES = 3
 
-    # Reasoning/thinking tags that models emit inline in content.
-    # Must stay in sync with cli.py _OPEN_TAGS/_CLOSE_TAGS and
-    # run_agent.py _strip_think_blocks() tag variants.
-    _OPEN_THINK_TAGS = (
-        "<REASONING_SCRATCHPAD>", "<think>", "<reasoning>",
-        "<THINKING>", "<thinking>", "<thought>",
-    )
-    _CLOSE_THINK_TAGS = (
-        "</REASONING_SCRATCHPAD>", "</think>", "</reasoning>",
-        "</THINKING>", "</thinking>", "</thought>",
-    )
-
     # Class-wide monotonic counter for native-streaming draft ids.  Telegram
     # animates a draft when the same draft_id is reused across consecutive
     # calls in the same chat, so we need a fresh non-zero id per response.
@@ -165,9 +152,8 @@ class GatewayStreamConsumer:
             getattr(adapter, "REQUIRES_EDIT_FINALIZE", False) is True
         )
 
-        # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
-        self._in_think_block = False
-        self._think_buffer = ""
+        # Think-block filter (shared with Feishu card streaming)
+        self._text_filter = StreamDisplayTextFilter()
 
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
@@ -305,100 +291,23 @@ class GatewayStreamConsumer:
     def _filter_and_accumulate(self, text: str) -> None:
         """Add a text delta to the accumulated buffer, suppressing think blocks.
 
-        Uses a state machine that tracks whether we are inside a
-        reasoning/thinking block.  Text inside such blocks is silently
-        discarded.  Partial tags at buffer boundaries are held back in
-        ``_think_buffer`` until enough characters arrive to decide.
+        Delegates think-block filtering to the shared StreamDisplayTextFilter
+        used by both the existing stream consumer and Feishu card streaming.
         """
-        buf = self._think_buffer + text
-        self._think_buffer = ""
-
-        while buf:
-            if self._in_think_block:
-                # Look for the earliest closing tag
-                best_idx = -1
-                best_len = 0
-                for tag in self._CLOSE_THINK_TAGS:
-                    idx = buf.find(tag)
-                    if idx != -1 and (best_idx == -1 or idx < best_idx):
-                        best_idx = idx
-                        best_len = len(tag)
-
-                if best_len:
-                    # Found closing tag — discard block, process remainder
-                    self._in_think_block = False
-                    buf = buf[best_idx + best_len:]
-                else:
-                    # No closing tag yet — hold tail that could be a
-                    # partial closing tag prefix, discard the rest.
-                    max_tag = max(len(t) for t in self._CLOSE_THINK_TAGS)
-                    self._think_buffer = buf[-max_tag:] if len(buf) > max_tag else buf
-                    return
-            else:
-                # Look for earliest opening tag at a block boundary
-                # (start of text / preceded by newline + optional whitespace).
-                # This prevents false positives when models *mention* tags
-                # in prose (e.g. "the <think> tag is used for…").
-                best_idx = -1
-                best_len = 0
-                for tag in self._OPEN_THINK_TAGS:
-                    search_start = 0
-                    while True:
-                        idx = buf.find(tag, search_start)
-                        if idx == -1:
-                            break
-                        # Block-boundary check (mirrors cli.py logic)
-                        if idx == 0:
-                            is_boundary = (
-                                not self._accumulated
-                                or self._accumulated.endswith("\n")
-                            )
-                        else:
-                            preceding = buf[:idx]
-                            last_nl = preceding.rfind("\n")
-                            if last_nl == -1:
-                                is_boundary = (
-                                    (not self._accumulated
-                                     or self._accumulated.endswith("\n"))
-                                    and preceding.strip() == ""
-                                )
-                            else:
-                                is_boundary = preceding[last_nl + 1:].strip() == ""
-
-                        if is_boundary and (best_idx == -1 or idx < best_idx):
-                            best_idx = idx
-                            best_len = len(tag)
-                            break  # first boundary hit for this tag is enough
-                        search_start = idx + 1
-
-                if best_len:
-                    # Emit text before the tag, enter think block
-                    self._accumulated += buf[:best_idx]
-                    self._in_think_block = True
-                    buf = buf[best_idx + best_len:]
-                else:
-                    # No opening tag — check for a partial tag at the tail
-                    held_back = 0
-                    for tag in self._OPEN_THINK_TAGS:
-                        for i in range(1, len(tag)):
-                            if buf.endswith(tag[:i]) and i > held_back:
-                                held_back = i
-                    if held_back:
-                        self._accumulated += buf[:-held_back]
-                        self._think_buffer = buf[-held_back:]
-                    else:
-                        self._accumulated += buf
-                    return
+        cleaned = self._text_filter.feed(text)
+        if cleaned:
+            self._accumulated += cleaned
 
     def _flush_think_buffer(self) -> None:
         """Flush any held-back partial-tag buffer into accumulated text.
 
-        Called when the stream ends (got_done) so that partial text that
-        was held back waiting for a possible opening tag is not lost.
+        Called when the stream ends (got_done).  The shared StreamDisplayTextFilter
+        handles partial-tag buffering internally, so we just flush its pending
+        state into the accumulated text.
         """
-        if self._think_buffer and not self._in_think_block:
-            self._accumulated += self._think_buffer
-            self._think_buffer = ""
+        flushed = self._text_filter.feed("")
+        if flushed:
+            self._accumulated += flushed
 
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
@@ -667,33 +576,15 @@ class GatewayStreamConsumer:
         except Exception as e:
             logger.error("Stream consumer error: %s", e)
 
-    # Strip MEDIA:<path> tags before display. Uses the shared anchored
-    # MEDIA_TAG_CLEANUP_RE from gateway/platforms/base.py — only tags whose
-    # path ends in a deliverable extension are removed, so an unknown-extension
-    # path stays visible instead of being silently dropped (issue #34517).
-    # Streaming and non-streaming paths share the same regex, so a tag is
-    # treated identically whichever path delivered the text.
-    _MEDIA_RE = MEDIA_TAG_CLEANUP_RE
-
     @staticmethod
     def _clean_for_display(text: str) -> str:
         """Strip MEDIA: directives and internal markers from text before display.
 
-        The streaming path delivers raw text chunks that may include
-        ``MEDIA:<path>`` tags and ``[[audio_as_voice]]`` directives meant for
-        the platform adapter's post-processing.  The actual media files are
-        delivered separately via ``_deliver_media_from_response()`` after the
-        stream finishes — we just need to hide the raw directives from the
-        user.
+        Delegates to the shared ``clean_stream_display_text`` so both
+        the existing stream consumer and Feishu card streaming produce
+        identical display text.
         """
-        if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
-            return text
-        cleaned = text.replace("[[audio_as_voice]]", "")
-        cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
-        # Collapse excessive blank lines left behind by removed tags
-        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
-        # Strip trailing whitespace/newlines but preserve leading content
-        return cleaned.rstrip()
+        return clean_stream_display_text(text)
 
     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
         """Send a new message chunk, optionally threaded to a previous message.
