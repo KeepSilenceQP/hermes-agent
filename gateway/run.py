@@ -17153,6 +17153,7 @@ class GatewayRunner:
                         _voice_ack_guild[0] = _gid
                         break
         _voice_ack_loop = asyncio.get_running_loop()
+        want_feishu_card_streaming_holder = [False]
 
         def voice_ack_callback(call_id, tool_name, args):
             """tool_start_callback: speak a one-time ack in the voice channel."""
@@ -17199,7 +17200,7 @@ class GatewayRunner:
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             # Route tool progress through the Feishu card sink when active.
-            if _want_feishu_card_streaming and _route_feishu_card_tool_progress(
+            if want_feishu_card_streaming_holder[0] and _route_feishu_card_tool_progress(
                 feishu_card_sink_holder[0],
                 event_type,
                 tool_name,
@@ -17844,6 +17845,7 @@ class GatewayRunner:
                 platform_key=platform_key,
                 user_config=user_config,
             )
+            want_feishu_card_streaming_holder[0] = _want_feishu_card_streaming
             if _want_feishu_card_streaming:
                 # When Feishu card streaming is active, skip the regular
                 # GatewayStreamConsumer and wire agent callbacks through the
