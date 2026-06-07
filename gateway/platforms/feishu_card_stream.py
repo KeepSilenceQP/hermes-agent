@@ -21,6 +21,7 @@ class FeishuCardToolBlock:
 
 @dataclass
 class FeishuCardRunState:
+    process_blocks: list[str] = field(default_factory=list)
     text_blocks: list[str] = field(default_factory=list)
     tools: list[FeishuCardToolBlock] = field(default_factory=list)
     terminal: str = "running"
@@ -36,7 +37,7 @@ class FeishuCardRunState:
 
     def append_commentary(self, text: str) -> None:
         if text:
-            self.text_blocks.append(text)
+            self.process_blocks.append(text)
 
     def start_tool(self, *, tool_name: str, preview: str = "", args: dict[str, Any] | None = None, token: str | None = None) -> str:
         if token is None:
@@ -67,12 +68,15 @@ class FeishuCardRunRenderer:
 
     def content(self, state: FeishuCardRunState, *, include_running_status: bool = True) -> str:
         content_parts: list[str] = []
-        for block in state.text_blocks:
+        for block in state.process_blocks:
             if block.strip():
                 content_parts.append(block)
         for tool in state.tools:
             preview = f" — `{tool.preview}`" if tool.preview else ""
             content_parts.append(f"**{tool.tool_name}**{preview}\n\nStatus: {tool.status}")
+        for block in state.text_blocks:
+            if block.strip():
+                content_parts.append(block)
         if include_running_status and state.terminal == "running":
             content_parts.append("_calling tools_" if state.tools else "_outputting_")
         return "\n\n".join(content_parts)
@@ -151,7 +155,17 @@ class FeishuCardRunSink:
         self._update_failures = 0
 
     def _visible_text_chars(self) -> int:
-        return sum(len(block) for block in self.state.text_blocks)
+        return sum(len(block) for block in self.state.process_blocks + self.state.text_blocks)
+
+    async def start(self, initial_text: str = "正在处理...") -> bool:
+        if initial_text:
+            self.state.append_commentary(initial_text)
+        if self.update_handle:
+            return await self.flush()
+        async with self._flush_lock:
+            self._sequence += 1
+            ok, _ = await self._ensure_card(include_running_status=False)
+            return ok
 
     def on_delta(self, text: str) -> None:
         self._enqueue("delta", text)
@@ -232,6 +246,11 @@ class FeishuCardRunSink:
         args: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
+        if event_type in {"_thinking", "reasoning.available"}:
+            text = preview or tool_name or ""
+            if text:
+                self.state.append_commentary(clean_stream_display_text(str(text)))
+            return
         if not tool_name:
             return
         token = kwargs.get("tool_call_id") or kwargs.get("call_id") or kwargs.get("id")

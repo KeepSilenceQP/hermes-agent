@@ -17,9 +17,9 @@ def test_renderer_streaming_card_contains_text_and_running_tool():
             "tag": "markdown",
             "element_id": "stream_md",
             "content": (
-                "I will inspect the repo.\n\n"
                 "**terminal** — `rg card_streaming`\n\n"
                 "Status: running\n\n"
+                "I will inspect the repo.\n\n"
                 "_calling tools_"
             ),
         }
@@ -213,6 +213,36 @@ def test_sink_finalize_without_prior_delta_creates_empty_streaming_card_then_tex
         assert created_card["body"]["elements"][0]["content"] == ""
         assert adapter.text_updated == [("card_1", "stream_md", "final answer", 2)]
         assert not adapter.updated
+
+    asyncio.run(run())
+
+
+def test_sink_start_creates_process_card_and_finalize_appends_answer():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        started = await sink.start("正在处理...")
+        delivered = await sink.finalize("final answer")
+
+        assert started is True
+        assert delivered is True
+        assert "正在处理..." in adapter.created[-1][1]["body"]["elements"][0]["content"]
+        assert adapter.text_updated[-1][2] == "正在处理...\n\nfinal answer"
+
+    asyncio.run(run())
+
+
+def test_sink_routes_thinking_progress_to_process_blocks():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        sink.on_tool_progress("_thinking", tool_name="我先检查当前状态")
+        await sink.drain_pending_updates()
+
+        assert adapter.created
+        assert "我先检查当前状态" in adapter.created[-1][1]["body"]["elements"][0]["content"]
 
     asyncio.run(run())
 

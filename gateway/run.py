@@ -17820,6 +17820,12 @@ class GatewayRunner:
                             metadata=_status_thread_metadata,
                             reply_to=event_message_id,
                         )
+                        safe_schedule_threadsafe(
+                            feishu_card_sink_holder[0].start(),
+                            _loop_for_step,
+                            logger=logger,
+                            log_message="Feishu card sink start scheduling error",
+                        )
                 except Exception as _card_err:
                     logger.debug("Could not set up Feishu card sink: %s", _card_err)
             if _should_create_gateway_stream_consumer(
