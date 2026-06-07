@@ -17,8 +17,7 @@ def test_renderer_streaming_card_contains_text_and_running_tool():
             "tag": "markdown",
             "element_id": "stream_md",
             "content": (
-                "**terminal** — `rg card_streaming`\n\n"
-                "Status: running\n\n"
+                "> ⏳ **command_execution** — `rg card_streaming`\n\n"
                 "I will inspect the repo.\n\n"
                 "_calling tools_"
             ),
@@ -26,9 +25,9 @@ def test_renderer_streaming_card_contains_text_and_running_tool():
     ]
     body = str(card["body"])
     assert "I will inspect the repo." in body
-    assert "terminal" in body
+    assert "command_execution" in body
     assert "rg card_streaming" in body
-    assert "running" in body.lower()
+    assert "⏳" in body
 
 
 def test_renderer_final_card_disables_streaming():
@@ -51,7 +50,8 @@ def test_tool_output_is_not_rendered():
     card = FeishuCardRunRenderer().render(state)
 
     assert "SECRET_OUTPUT_SHOULD_NOT_RENDER" not in str(card)
-    assert "terminal" in str(card)
+    assert "command_execution" in str(card)
+    assert "✅" in str(card)
 
 
 def test_repeated_same_name_tools_get_distinct_tokens():

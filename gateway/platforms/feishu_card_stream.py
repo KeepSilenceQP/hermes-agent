@@ -66,14 +66,32 @@ class FeishuCardRunState:
 class FeishuCardRunRenderer:
     STREAM_ELEMENT_ID = "stream_md"
 
+    @staticmethod
+    def _tool_display_name(tool_name: str) -> str:
+        if tool_name in {"terminal", "exec_command"}:
+            return "command_execution"
+        return tool_name
+
+    @staticmethod
+    def _inline_code(text: str) -> str:
+        return text.replace("`", "'")
+
+    def _tool_line(self, tool: FeishuCardToolBlock) -> str:
+        icon = "✅" if tool.status == "done" else ("❌" if tool.status == "error" else "⏳")
+        name = self._tool_display_name(tool.tool_name)
+        preview = tool.preview
+        if not preview:
+            preview = str(tool.args.get("command") or tool.args.get("cmd") or "")
+        suffix = f" — `{self._inline_code(preview)}`" if preview else ""
+        return f"> {icon} **{name}**{suffix}"
+
     def content(self, state: FeishuCardRunState, *, include_running_status: bool = True) -> str:
         content_parts: list[str] = []
         for block in state.process_blocks:
             if block.strip():
                 content_parts.append(block)
         for tool in state.tools:
-            preview = f" — `{tool.preview}`" if tool.preview else ""
-            content_parts.append(f"**{tool.tool_name}**{preview}\n\nStatus: {tool.status}")
+            content_parts.append(self._tool_line(tool))
         for block in state.text_blocks:
             if block.strip():
                 content_parts.append(block)
@@ -256,12 +274,22 @@ class FeishuCardRunSink:
         token = kwargs.get("tool_call_id") or kwargs.get("call_id") or kwargs.get("id")
         if event_type == "tool.started":
             self.state.start_tool(tool_name=tool_name, preview=preview or "", args=args, token=token)
+            logger.info(
+                "feishu_card_tool_event event=started tool=%s preview_chars=%s",
+                tool_name,
+                len(preview or ""),
+            )
         elif event_type == "tool.completed":
             ok = not bool(kwargs.get("error") or kwargs.get("failed"))
             if token:
                 self.state.finish_tool(str(token), ok=ok)
             else:
                 self.state.finish_oldest_running_tool(tool_name=tool_name, ok=ok)
+            logger.info(
+                "feishu_card_tool_event event=completed tool=%s ok=%s",
+                tool_name,
+                ok,
+            )
 
     def _record_update_failure(self) -> None:
         self._update_failures += 1
