@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import threading
@@ -16,6 +17,7 @@ class FeishuCardToolBlock:
     tool_name: str
     preview: str = ""
     args: dict[str, Any] = field(default_factory=dict)
+    output: str = ""
     status: str = "running"
 
 
@@ -50,12 +52,16 @@ class FeishuCardRunState:
         for tool in self.tools:
             if tool.token == token:
                 tool.status = "done" if ok else "error"
+                if output:
+                    tool.output = output
                 return
 
-    def finish_oldest_running_tool(self, *, tool_name: str, ok: bool = True) -> str | None:
+    def finish_oldest_running_tool(self, *, tool_name: str, ok: bool = True, output: str | None = None) -> str | None:
         for tool in self.tools:
             if tool.tool_name == tool_name and tool.status == "running":
                 tool.status = "done" if ok else "error"
+                if output:
+                    tool.output = output
                 return tool.token
         return None
 
@@ -76,6 +82,15 @@ class FeishuCardRunRenderer:
     def _inline_code(text: str) -> str:
         return text.replace("`", "'")
 
+    @staticmethod
+    def _tool_output(text: str) -> str:
+        text = text.strip()
+        if not text:
+            return ""
+        if len(text) > 1200:
+            text = f"{text[:1200]}..."
+        return f"\n> **Output**\n> ```\n{text}\n> ```"
+
     def _tool_line(self, tool: FeishuCardToolBlock) -> str:
         icon = "✅" if tool.status == "done" else ("❌" if tool.status == "error" else "⏳")
         name = self._tool_display_name(tool.tool_name)
@@ -83,7 +98,8 @@ class FeishuCardRunRenderer:
         if not preview:
             preview = str(tool.args.get("command") or tool.args.get("cmd") or "")
         suffix = f" — `{self._inline_code(preview)}`" if preview else ""
-        return f"> {icon} **{name}**{suffix}"
+        output = self._tool_output(tool.output) if tool.status == "error" else ""
+        return f"> {icon} **{name}**{suffix}{output}"
 
     def content(self, state: FeishuCardRunState, *, include_running_status: bool = True) -> str:
         content_parts: list[str] = []
@@ -280,16 +296,30 @@ class FeishuCardRunSink:
                 len(preview or ""),
             )
         elif event_type == "tool.completed":
-            ok = not bool(kwargs.get("error") or kwargs.get("failed"))
+            ok = not bool(kwargs.get("error") or kwargs.get("failed") or kwargs.get("is_error"))
+            output = self._stringify_tool_result(
+                kwargs["result"] if "result" in kwargs else kwargs.get("output")
+            )
             if token:
-                self.state.finish_tool(str(token), ok=ok)
+                self.state.finish_tool(str(token), ok=ok, output=output)
             else:
-                self.state.finish_oldest_running_tool(tool_name=tool_name, ok=ok)
+                self.state.finish_oldest_running_tool(tool_name=tool_name, ok=ok, output=output)
             logger.info(
                 "feishu_card_tool_event event=completed tool=%s ok=%s",
                 tool_name,
                 ok,
             )
+
+    @staticmethod
+    def _stringify_tool_result(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value
+        try:
+            return json.dumps(value, ensure_ascii=False, default=str)
+        except Exception:
+            return str(value)
 
     def _record_update_failure(self) -> None:
         self._update_failures += 1
