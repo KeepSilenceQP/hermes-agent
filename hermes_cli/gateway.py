@@ -3010,7 +3010,8 @@ def generate_launchd_plist() -> str:
     # to launchd's WorkingDirectory as to systemd's).
     working_dir = _stable_service_working_dir()
     hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
+    user_home = str(_launchd_user_home())
+    log_dir = _launchd_user_home() / "Library" / "Logs" / "Hermes"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     profile_arg = _profile_arg(hermes_home)
@@ -3037,6 +3038,7 @@ def generate_launchd_plist() -> str:
 
     # Build ProgramArguments array, including --profile when using a named profile
     prog_args = [
+        "<string>/usr/bin/env</string>",
         f"<string>{python_path}</string>",
         "<string>-m</string>",
         "<string>hermes_cli.main</string>",
@@ -3074,6 +3076,8 @@ def generate_launchd_plist() -> str:
         <string>{sane_path}</string>
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
+        <key>HOME</key>
+        <string>{user_home}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
     </dict>
