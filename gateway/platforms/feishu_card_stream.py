@@ -63,26 +63,40 @@ class FeishuCardRunState:
 
 
 class FeishuCardRunRenderer:
+    STREAM_ELEMENT_ID = "stream_md"
+
     def render(self, state: FeishuCardRunState) -> dict[str, Any]:
-        elements: list[dict[str, Any]] = []
+        content_parts: list[str] = []
         for block in state.text_blocks:
             if block.strip():
-                elements.append({"tag": "markdown", "content": block})
+                content_parts.append(block)
         for tool in state.tools:
             preview = f" — `{tool.preview}`" if tool.preview else ""
-            elements.append({
-                "tag": "markdown",
-                "content": f"**{tool.tool_name}**{preview}\n\nStatus: {tool.status}",
-            })
+            content_parts.append(f"**{tool.tool_name}**{preview}\n\nStatus: {tool.status}")
         if state.terminal == "running":
-            elements.append({"tag": "markdown", "content": "_calling tools_" if state.tools else "_outputting_"})
+            content_parts.append("_calling tools_" if state.tools else "_outputting_")
+        content = "\n\n".join(content_parts) or "_running_"
         return {
             "schema": "2.0",
             "config": {
+                "enable_forward_interaction": False,
+                "streaming_config": {
+                    "print_frequency_ms": {"default": 70},
+                    "print_step": {"default": 1},
+                    "print_strategy": "fast",
+                },
                 "streaming_mode": state.terminal == "running",
                 "summary": {"content": "running" if state.terminal == "running" else "done"},
             },
-            "body": {"elements": elements or [{"tag": "markdown", "content": "_running_"}]},
+            "body": {
+                "elements": [
+                    {
+                        "tag": "markdown",
+                        "element_id": self.STREAM_ELEMENT_ID,
+                        "content": content,
+                    }
+                ]
+            },
         }
 
 
@@ -132,6 +146,9 @@ class FeishuCardRunSink:
         self._flush_lock = asyncio.Lock()
         self._sequence = 0
         self._update_failures = 0
+
+    def _visible_text_chars(self) -> int:
+        return sum(len(block) for block in self.state.text_blocks)
 
     def on_delta(self, text: str) -> None:
         self._enqueue("delta", text)
@@ -272,6 +289,13 @@ class FeishuCardRunSink:
                 or getattr(result, "card_id", None)
                 or getattr(result, "message_id", None)
             )
+            logger.info(
+                "feishu_card_create_success seq=%s text_chars=%s tools=%s terminal=%s",
+                self._sequence,
+                self._visible_text_chars(),
+                len(self.state.tools),
+                self.state.terminal,
+            )
             return bool(self.update_handle), True
         logger.warning("feishu_card_create_failed")
         return False, False
@@ -293,6 +317,14 @@ class FeishuCardRunSink:
             ok = bool(getattr(result, "success", False))
             if not ok:
                 logger.warning("feishu_card_update_failed: %s", getattr(result, "error", None) or "unknown error")
+            else:
+                logger.info(
+                    "feishu_card_update_success seq=%s text_chars=%s tools=%s terminal=%s",
+                    seq,
+                    self._visible_text_chars(),
+                    len(self.state.tools),
+                    self.state.terminal,
+                )
             return ok
 
     def _flush_text_filter_pending(self) -> None:

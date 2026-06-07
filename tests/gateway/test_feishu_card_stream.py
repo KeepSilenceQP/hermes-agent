@@ -10,6 +10,20 @@ def test_renderer_streaming_card_contains_text_and_running_tool():
 
     assert card["schema"] == "2.0"
     assert card["config"]["streaming_mode"] is True
+    assert card["config"]["enable_forward_interaction"] is False
+    assert card["config"]["streaming_config"]["print_strategy"] == "fast"
+    assert card["body"]["elements"] == [
+        {
+            "tag": "markdown",
+            "element_id": "stream_md",
+            "content": (
+                "I will inspect the repo.\n\n"
+                "**terminal** — `rg card_streaming`\n\n"
+                "Status: running\n\n"
+                "_calling tools_"
+            ),
+        }
+    ]
     body = str(card["body"])
     assert "I will inspect the repo." in body
     assert "terminal" in body
@@ -25,6 +39,7 @@ def test_renderer_final_card_disables_streaming():
     card = FeishuCardRunRenderer().render(state)
 
     assert card["config"]["streaming_mode"] is False
+    assert card["body"]["elements"][0]["element_id"] == "stream_md"
     assert "Done." in str(card["body"])
 
 
