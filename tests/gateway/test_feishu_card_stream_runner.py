@@ -284,6 +284,50 @@ def test_card_sink_callback_routing_tool_progress():
     asyncio.run(run())
 
 
+def test_card_sink_renders_tool_result_output_and_error_state():
+    """Tool completion carries output/error state into the rendered card."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from gateway.platforms.feishu_card_stream import FeishuCardRunSink
+
+    class _Adapter:
+        def __init__(self):
+            self.created = []
+            self.updated = []
+
+        async def create_card_stream_message(self, chat_id, card, metadata=None, reply_to=None):
+            self.created.append(card)
+            return SimpleNamespace(success=True, message_id="om_1", card_id="card_1")
+
+        async def update_card_stream_message(self, update_handle, card, sequence=None):
+            self.updated.append(card)
+            return SimpleNamespace(success=True)
+
+        async def send(self, chat_id, content, metadata=None, reply_to=None):
+            return SimpleNamespace(success=True, message_id="om_fb")
+
+    async def run():
+        adapter = _Adapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_test", update_interval_sec=0)
+
+        sink.on_tool_progress("tool.started", tool_name="terminal", preview="ls")
+        sink.on_tool_progress(
+            "tool.completed",
+            tool_name="terminal",
+            is_error=True,
+            result="permission denied",
+        )
+        await sink.drain_pending_updates()
+
+        rendered = str(adapter.created[0])
+        assert "command_execution" in rendered
+        assert "permission denied" in rendered
+        assert "❌" in rendered
+
+    asyncio.run(run())
+
+
 def test_card_sink_callback_routing_interim_commentary():
     """Interim commentary routes via on_commentary, not on_delta."""
     import asyncio
