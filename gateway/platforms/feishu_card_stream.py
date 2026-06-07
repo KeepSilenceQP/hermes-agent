@@ -216,8 +216,10 @@ class FeishuCardRunSink:
 
     def _record_update_failure(self) -> None:
         self._update_failures += 1
+        logger.warning("feishu_card_update_failed")
         if self._update_failures >= self.max_update_failures:
             self.card_updates_disabled = True
+            logger.warning("feishu_card_updates_disabled")
 
     async def drain_pending_updates(self) -> None:
         task = self._drain_task
@@ -236,6 +238,7 @@ class FeishuCardRunSink:
             self.fallback_sent = True
             self.final_response_sent = True
             self.final_content_delivered = True
+            logger.info("feishu_card_fallback_sent")
             return True
         return False
 
@@ -254,6 +257,7 @@ class FeishuCardRunSink:
                 or getattr(result, "message_id", None)
             )
             return bool(self.update_handle)
+        logger.warning("feishu_card_create_failed")
         return False
 
     async def flush(self) -> bool:
