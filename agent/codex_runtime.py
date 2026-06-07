@@ -43,6 +43,11 @@ def run_codex_app_server_turn(
     """
     from agent.transports.codex_app_server_session import CodexAppServerSession
 
+    def _tool_progress_callback(*args, **kwargs):
+        callback = getattr(agent, "tool_progress_callback", None)
+        if callback is not None:
+            callback(*args, **kwargs)
+
     # Lazy session: one CodexAppServerSession per AIAgent instance.
     # Spawned on first turn, reused across turns, closed at AIAgent
     # shutdown (see _cleanup hook).
@@ -59,7 +64,13 @@ def run_codex_app_server_turn(
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
             approval_callback=approval_callback,
+            tool_progress_callback=_tool_progress_callback,
         )
+    else:
+        # AIAgent instances are cached while gateway display callbacks are
+        # installed per run, so keep reused Codex sessions wired to the current
+        # callback instead of the one from session construction time.
+        agent._codex_session._tool_progress_callback = _tool_progress_callback
 
     # NOTE: the user message is ALREADY appended to messages by the
     # standard run_conversation() flow (line ~11823) before the early

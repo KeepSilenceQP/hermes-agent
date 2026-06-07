@@ -37,7 +37,10 @@ from agent.transports.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
 )
-from agent.transports.codex_event_projector import CodexEventProjector
+from agent.transports.codex_event_projector import (
+    CodexEventProjector,
+    _deterministic_call_id,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +205,7 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
+        tool_progress_callback: Optional[Callable[..., None]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
@@ -216,6 +220,7 @@ class CodexAppServerSession:
             )
         )
         self._approval_callback = approval_callback
+        self._tool_progress_callback = tool_progress_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
@@ -229,6 +234,7 @@ class CodexAppServerSession:
         # approval params don't carry the changeset, so we cache here
         # to surface a real summary in the approval prompt (quirk #4).
         self._pending_file_changes: dict[str, str] = {}
+        self._started_tool_progress_ids: set[str] = set()
         self._closed = False
 
     # ---------- lifecycle ----------
@@ -356,6 +362,145 @@ class CodexAppServerSession:
             return base
         redacted = redact_sensitive_text(joined, force=True)
         return f"{base}\ncodex stderr (last {len(tail)} lines):\n{redacted}"
+
+    def _emit_tool_progress_from_codex_item(self, notification: dict) -> None:
+        """Mirror Codex app-server tool items into Hermes' display progress.
+
+        The projector already turns completed tool-shaped Codex items into
+        conversation history. The gateway/card sink listens to
+        tool_progress_callback instead, so without this bridge Feishu never sees
+        command/MCP progress even though the transcript is correct.
+        """
+        if self._tool_progress_callback is None:
+            return
+        method = notification.get("method") or ""
+        if method not in {"item/started", "item/completed"}:
+            return
+        item = ((notification.get("params") or {}).get("item") or {})
+        event = self._tool_progress_event_from_item(item)
+        if event is None:
+            return
+
+        tool_id = event["tool_call_id"]
+        if method == "item/started":
+            if tool_id in self._started_tool_progress_ids:
+                return
+            self._started_tool_progress_ids.add(tool_id)
+            try:
+                self._tool_progress_callback(
+                    "tool.started",
+                    event["name"],
+                    event["preview"],
+                    event["args"],
+                )
+            except Exception:  # pragma: no cover - display callback
+                logger.debug("tool progress callback raised", exc_info=True)
+            return
+
+        # Some Codex builds only expose completed items. Emit a synthetic start
+        # first so the card can still render a coherent tool row.
+        if tool_id not in self._started_tool_progress_ids:
+            self._started_tool_progress_ids.add(tool_id)
+            try:
+                self._tool_progress_callback(
+                    "tool.started",
+                    event["name"],
+                    event["preview"],
+                    event["args"],
+                )
+            except Exception:  # pragma: no cover - display callback
+                logger.debug("tool progress callback raised", exc_info=True)
+        try:
+            self._tool_progress_callback(
+                "tool.completed",
+                event["name"],
+                None,
+                None,
+                duration=None,
+                is_error=event["is_error"],
+                result=event["result"],
+            )
+        except Exception:  # pragma: no cover - display callback
+            logger.debug("tool progress callback raised", exc_info=True)
+
+    def _tool_progress_event_from_item(self, item: dict) -> Optional[dict]:
+        item_type = item.get("type") or ""
+        item_id = item.get("id") or ""
+        if item_type == "commandExecution":
+            call_id = _deterministic_call_id("exec", item_id)
+            args = {
+                "command": item.get("command") or "",
+                "cwd": item.get("cwd") or "",
+            }
+            output = item.get("aggregatedOutput") or ""
+            exit_code = item.get("exitCode")
+            is_error = exit_code is not None and exit_code != 0
+            if is_error:
+                output = f"[exit {exit_code}]\n{output}"
+            return {
+                "tool_call_id": call_id,
+                "name": "exec_command",
+                "preview": args["command"],
+                "args": args,
+                "is_error": is_error,
+                "result": output,
+            }
+        if item_type == "fileChange":
+            call_id = _deterministic_call_id("apply_patch", item_id)
+            changes_summary = []
+            for change in item.get("changes") or []:
+                kind = (change.get("kind") or {}).get("type") or "update"
+                path = change.get("path") or ""
+                changes_summary.append({"kind": kind, "path": path})
+            status = item.get("status") or "unknown"
+            return {
+                "tool_call_id": call_id,
+                "name": "apply_patch",
+                "preview": f"apply_patch {len(changes_summary)} change(s)",
+                "args": {"changes": changes_summary},
+                "is_error": status not in {"completed", "success", "unknown"},
+                "result": f"apply_patch status={status}, {len(changes_summary)} change(s)",
+            }
+        if item_type == "mcpToolCall":
+            server = item.get("server") or "mcp"
+            tool = item.get("tool") or "unknown"
+            call_id = _deterministic_call_id(f"mcp_{server}_{tool}", item_id)
+            args = item.get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {"arguments": args}
+            error = item.get("error")
+            result = item.get("result")
+            if error:
+                content = f"[error] {error}"
+            elif result is not None:
+                content = str(result)
+            else:
+                content = ""
+            return {
+                "tool_call_id": call_id,
+                "name": f"mcp.{server}.{tool}",
+                "preview": f"{server}.{tool}",
+                "args": args,
+                "is_error": bool(error),
+                "result": content,
+            }
+        if item_type == "dynamicToolCall":
+            tool = item.get("tool") or "unknown"
+            call_id = _deterministic_call_id(f"dyn_{tool}", item_id)
+            args = item.get("arguments") or {}
+            if not isinstance(args, dict):
+                args = {"arguments": args}
+            success = item.get("success")
+            content_items = item.get("contentItems") or []
+            return {
+                "tool_call_id": call_id,
+                "name": tool,
+                "preview": tool,
+                "args": args,
+                "is_error": success is False,
+                "result": str(content_items) if content_items else f"success={success}",
+            }
+        return None
 
     # ---------- per-turn ----------
 
@@ -502,6 +647,7 @@ class CodexAppServerSession:
                     if pending is None:
                         break
                     self._track_pending_file_change(pending)
+                    self._emit_tool_progress_from_codex_item(pending)
                     proj = projector.project(pending)
                     if proj.messages:
                         result.projected_messages.extend(proj.messages)
@@ -541,6 +687,7 @@ class CodexAppServerSession:
             # approval (the approval params themselves don't carry the
             # changeset). Quirk #4 fix.
             self._track_pending_file_change(note)
+            self._emit_tool_progress_from_codex_item(note)
 
             # Project into messages
             projection = projector.project(note)

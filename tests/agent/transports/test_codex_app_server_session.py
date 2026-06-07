@@ -254,6 +254,65 @@ class TestRunTurn:
         # Each tool item produces (assistant, tool) — 2*2 + final assistant = 5 msgs
         assert len(r.projected_messages) == 5
 
+    def test_codex_command_events_emit_tool_progress_callback(self):
+        client = FakeClient()
+        progress = []
+        client.queue_notification(
+            "item/started",
+            item={
+                "type": "commandExecution",
+                "id": "cmd1",
+                "command": "ls ~/Desktop",
+                "cwd": "/tmp",
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "cmd1",
+                "command": "ls ~/Desktop",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "a.txt\n",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="t",
+            turnId="tu1",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+        s = make_session(
+            client,
+            tool_progress_callback=lambda *args, **kwargs: progress.append(
+                (args, kwargs)
+            ),
+        )
+
+        r = s.run_turn("show desktop", turn_timeout=2.0)
+
+        assert r.error is None
+        assert progress[0][0][:4] == (
+            "tool.started",
+            "exec_command",
+            "ls ~/Desktop",
+            {"command": "ls ~/Desktop", "cwd": "/tmp"},
+        )
+        assert progress[1][0][:4] == (
+            "tool.completed",
+            "exec_command",
+            None,
+            None,
+        )
+        assert progress[1][1]["result"] == "a.txt\n"
+        assert progress[1][1]["is_error"] is False
+
     def test_turn_start_failure_returns_error(self):
         client = FakeClient()
         from agent.transports.codex_app_server import CodexAppServerError
