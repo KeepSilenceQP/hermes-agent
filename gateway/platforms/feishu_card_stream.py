@@ -272,11 +272,22 @@ class FeishuCardRunSink:
             )
             return bool(getattr(result, "success", False))
 
+    def _flush_text_filter_pending(self) -> None:
+        """Flush any partial-tag text held by the think-block filter into state."""
+        flushed = self.text_filter.feed("")
+        if flushed:
+            cleaned = clean_stream_display_text(flushed)
+            if cleaned:
+                self.state.append_text(cleaned)
+
     async def finalize(self, final_text: str) -> bool:
         self._closed = True
         await self.drain_pending_updates()
-        if final_text and not "".join(self.state.text_blocks).strip():
-            self.state.append_text(final_text)
+        self._flush_text_filter_pending()
+        # Use final_text as the authoritative final content, replacing
+        # accumulated streaming text so the card always shows the complete answer.
+        if final_text:
+            self.state.text_blocks = [clean_stream_display_text(final_text)]
         self.state.finalize()
         if await self.flush():
             self.final_response_sent = True
@@ -287,6 +298,7 @@ class FeishuCardRunSink:
     async def update_final_after_transform(self, final_text: str) -> bool:
         self._closed = True
         await self.drain_pending_updates()
+        self._flush_text_filter_pending()
         self.state.text_blocks = [final_text] if final_text else self.state.text_blocks
         self.state.finalize()
         if self.update_handle and await self.flush():
@@ -298,7 +310,9 @@ class FeishuCardRunSink:
     async def finish_failed(self, error_text: str) -> bool:
         self._closed = True
         await self.drain_pending_updates()
-        self.state.append_commentary(error_text)
+        self._flush_text_filter_pending()
+        if error_text:
+            self.state.append_commentary(clean_stream_display_text(error_text))
         self.state.terminal = "error"
         if self.update_handle and await self.flush():
             self.final_response_sent = True

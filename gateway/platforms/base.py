@@ -1552,6 +1552,7 @@ class SendResult:
     # made up the full payload, in send order.  Empty tuple for the common
     # single-message case.
     continuation_message_ids: tuple = ()
+    card_id: Optional[str] = None  # CardKit card entity id for streaming card updates
 
 
 class EphemeralReply(str):

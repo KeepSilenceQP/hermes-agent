@@ -1973,30 +1973,37 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _create_card_stream_transport(
         self, chat_id: str, card: Dict[str, Any], metadata=None, reply_to=None
     ) -> SendResult:
-        """Create a CardKit card via the SDK async API.
+        """Send a CardKit card as an interactive message to the chat.
 
-        Returns the card_id as the update_handle for subsequent updates.
+        Returns both ``message_id`` (visible Feishu message) and ``card_id``
+        (CardKit entity handle for subsequent streaming updates).
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
-            from lark_oapi.api.cardkit.v1 import (
-                CreateCardRequest,
-                CreateCardRequestBody,
+            # Send card as interactive message so it is visible in the chat.
+            payload = json.dumps(card, ensure_ascii=False)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=reply_to,
+                metadata=metadata,
             )
+            if not self._response_succeeded(response):
+                return self._response_error_result(response, default_message="card stream create failed")
 
-            card_body = CreateCardRequestBody.builder()
-            card_body.type(card.get("schema", "2.0"))
-            card_body.data(json.dumps(card))
-            request = CreateCardRequest.builder()
-            request.request_body(card_body.build())
-            response = await self._client.cardkit.v1.card.acreate(request.build())
-            if response.success() and response.data:
-                card_id = getattr(response.data, "card_id", "")
-                return SendResult(success=True, message_id=card_id, card_id=card_id)
+            message_id = self._extract_response_field(response, "message_id")
+            if not message_id:
+                return SendResult(success=False, error="card stream create: no message_id in response")
+
+            # Convert message_id to CardKit card_id for subsequent streaming updates.
+            card_id = await self._convert_message_id_to_card_id(message_id)
             return SendResult(
-                success=False,
-                error=f"cardkit create failed: code={response.code} msg={response.msg}",
+                success=True,
+                message_id=message_id,
+                card_id=card_id or message_id,
+                raw_response=response,
             )
         except ImportError:
             logger.warning("[Feishu] cardkit SDK not available")
@@ -2004,6 +2011,35 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[Feishu] card create transport error: %s", exc)
             return SendResult(success=False, error=str(exc))
+
+    async def _convert_message_id_to_card_id(self, message_id: str) -> str | None:
+        """Convert an IM message_id to a CardKit card_id via the id_convert API.
+
+        Returns the card_id on success, or None if conversion is not available.
+        """
+        try:
+            from lark_oapi.api.cardkit.v1 import (
+                IdConvertCardRequest,
+                IdConvertCardRequestBody,
+            )
+
+            body = IdConvertCardRequestBody.builder()
+            body.message_id(message_id)
+            request = IdConvertCardRequest.builder()
+            request.request_body(body.build())
+            response = await self._client.cardkit.v1.card.aid_convert(request.build())
+            if (hasattr(response, "success") and response.success()) or (
+                hasattr(response, "code") and response.code == 0
+            ):
+                card_id = getattr(response.data, "card_id", "") if response.data else ""
+                if card_id:
+                    return card_id
+            return None
+        except ImportError:
+            return None
+        except Exception as exc:
+            logger.warning("[Feishu] card_id conversion failed: %s", exc)
+            return None
 
     async def _update_card_stream_transport(
         self, update_handle: str, card: Dict[str, Any], sequence=None
