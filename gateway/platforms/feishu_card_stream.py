@@ -303,7 +303,10 @@ class FeishuCardRunSink:
         if final_text:
             cleaned = clean_stream_display_text(final_text)
             if cleaned:
-                self.state.append_text(cleaned)
+                if self.state.text_blocks and cleaned.startswith(self.state.text_blocks[-1]):
+                    self.state.text_blocks[-1] = cleaned
+                else:
+                    self.state.text_blocks.append(cleaned)
         self.state.finalize()
         if await self.flush():
             self.final_response_sent = True
