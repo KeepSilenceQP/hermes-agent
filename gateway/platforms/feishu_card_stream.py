@@ -65,7 +65,7 @@ class FeishuCardRunState:
 class FeishuCardRunRenderer:
     STREAM_ELEMENT_ID = "stream_md"
 
-    def render(self, state: FeishuCardRunState) -> dict[str, Any]:
+    def content(self, state: FeishuCardRunState, *, include_running_status: bool = True) -> str:
         content_parts: list[str] = []
         for block in state.text_blocks:
             if block.strip():
@@ -73,9 +73,12 @@ class FeishuCardRunRenderer:
         for tool in state.tools:
             preview = f" — `{tool.preview}`" if tool.preview else ""
             content_parts.append(f"**{tool.tool_name}**{preview}\n\nStatus: {tool.status}")
-        if state.terminal == "running":
+        if include_running_status and state.terminal == "running":
             content_parts.append("_calling tools_" if state.tools else "_outputting_")
-        content = "\n\n".join(content_parts) or "_running_"
+        return "\n\n".join(content_parts)
+
+    def render(self, state: FeishuCardRunState, *, include_running_status: bool = True) -> dict[str, Any]:
+        content = self.content(state, include_running_status=include_running_status)
         return {
             "schema": "2.0",
             "config": {
@@ -269,7 +272,7 @@ class FeishuCardRunSink:
             return True
         return False
 
-    async def _ensure_card(self) -> tuple[bool, bool]:
+    async def _ensure_card(self, *, include_running_status: bool = True) -> tuple[bool, bool]:
         """Ensure a card exists. Returns (success, created_now).
 
         ``created_now`` is True when the card was just created (first flush).
@@ -278,7 +281,7 @@ class FeishuCardRunSink:
         """
         if self.update_handle:
             return True, False
-        card = self.renderer.render(self.state)
+        card = self.renderer.render(self.state, include_running_status=include_running_status)
         result = await self.adapter.create_card_stream_message(
             self.chat_id, card, metadata=self.metadata, reply_to=self.reply_to
         )
@@ -300,6 +303,32 @@ class FeishuCardRunSink:
         logger.warning("feishu_card_create_failed")
         return False, False
 
+    async def _update_stream_text(self, seq: int) -> bool:
+        content = self.renderer.content(self.state)
+        if hasattr(self.adapter, "update_card_stream_text"):
+            result = await self.adapter.update_card_stream_text(
+                self.update_handle,
+                self.renderer.STREAM_ELEMENT_ID,
+                content,
+                sequence=seq,
+            )
+        else:
+            result = await self.adapter.update_card_stream_message(
+                self.update_handle, self.renderer.render(self.state), sequence=seq
+            )
+        ok = bool(getattr(result, "success", False))
+        if not ok:
+            logger.warning("feishu_card_update_failed: %s", getattr(result, "error", None) or "unknown error")
+        else:
+            logger.info(
+                "feishu_card_update_success seq=%s text_chars=%s tools=%s terminal=%s",
+                seq,
+                self._visible_text_chars(),
+                len(self.state.tools),
+                self.state.terminal,
+            )
+        return ok
+
     async def flush(self) -> bool:
         if self.card_updates_disabled:
             return False
@@ -311,21 +340,7 @@ class FeishuCardRunSink:
             # Card was just created with the current state — no update needed.
             if created_now:
                 return True
-            result = await self.adapter.update_card_stream_message(
-                self.update_handle, self.renderer.render(self.state), sequence=seq
-            )
-            ok = bool(getattr(result, "success", False))
-            if not ok:
-                logger.warning("feishu_card_update_failed: %s", getattr(result, "error", None) or "unknown error")
-            else:
-                logger.info(
-                    "feishu_card_update_success seq=%s text_chars=%s tools=%s terminal=%s",
-                    seq,
-                    self._visible_text_chars(),
-                    len(self.state.tools),
-                    self.state.terminal,
-                )
-            return ok
+            return await self._update_stream_text(seq)
 
     def _flush_text_filter_pending(self) -> None:
         """Flush any partial-tag text held by the think-block filter into state."""
@@ -336,9 +351,16 @@ class FeishuCardRunSink:
                 self.state.append_text(cleaned)
 
     async def finalize(self, final_text: str) -> bool:
-        self._closed = True
         await self.drain_pending_updates()
         self._flush_text_filter_pending()
+        if not self.update_handle and final_text and not self.card_updates_disabled:
+            async with self._flush_lock:
+                self._sequence += 1
+                ok, _ = await self._ensure_card(include_running_status=False)
+            if not ok:
+                fallback = final_text or "".join(self.state.text_blocks) or "(empty response)"
+                return await self._send_fallback_text(fallback)
+        self._closed = True
         if final_text:
             cleaned = clean_stream_display_text(final_text)
             if cleaned:

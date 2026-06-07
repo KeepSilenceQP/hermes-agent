@@ -89,6 +89,7 @@ class _FakeFeishuCardAdapter:
     def __init__(self):
         self.created = []
         self.updated = []
+        self.text_updated = []
         self.sent_text = []
 
     async def create_card_stream_message(self, chat_id, card, metadata=None, reply_to=None):
@@ -97,6 +98,10 @@ class _FakeFeishuCardAdapter:
 
     async def update_card_stream_message(self, update_handle, card, sequence=None):
         self.updated.append((update_handle, card, sequence))
+        return SimpleNamespace(success=True)
+
+    async def update_card_stream_text(self, update_handle, element_id, content, sequence=None):
+        self.text_updated.append((update_handle, element_id, content, sequence))
         return SimpleNamespace(success=True)
 
     async def send(self, chat_id, content, metadata=None, reply_to=None):
@@ -131,7 +136,7 @@ def test_sink_delta_schedules_update_before_finalize():
         # Second delta triggers an actual update (card already exists).
         sink.on_delta(" more")
         await sink.drain_pending_updates()
-        assert adapter.updated
+        assert adapter.text_updated
 
     asyncio.run(run())
 
@@ -142,9 +147,9 @@ def test_sink_continues_updates_for_deltas_queued_during_flush():
             super().__init__()
             self.first_update_started = asyncio.Event()
 
-        async def update_card_stream_message(self, update_handle, card, sequence=None):
-            self.updated.append((update_handle, card, sequence))
-            if len(self.updated) == 1:
+        async def update_card_stream_text(self, update_handle, element_id, content, sequence=None):
+            self.text_updated.append((update_handle, element_id, content, sequence))
+            if len(self.text_updated) == 1:
                 self.first_update_started.set()
                 await asyncio.sleep(0.01)
             return SimpleNamespace(success=True)
@@ -162,8 +167,8 @@ def test_sink_continues_updates_for_deltas_queued_during_flush():
         sink.on_delta(" three")
         await sink.drain_pending_updates()
 
-        assert len(adapter.updated) >= 2
-        assert "one two three" in str(adapter.updated[-1][1])
+        assert len(adapter.text_updated) >= 2
+        assert "one two three" in adapter.text_updated[-1][2]
 
     asyncio.run(run())
 
@@ -187,9 +192,27 @@ def test_sink_finalize_replaces_compact_streamed_block_with_final_text():
         delivered = await sink.finalize(final_text)
 
         assert delivered is True
-        rendered_content = adapter.updated[-1][1]["body"]["elements"][0]["content"]
+        rendered_content = adapter.text_updated[-1][2]
         assert rendered_content == final_text
-        assert compact not in str(adapter.updated[-1][1])
+        assert compact not in rendered_content
+
+    asyncio.run(run())
+
+
+def test_sink_finalize_without_prior_delta_creates_empty_streaming_card_then_text_update():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        delivered = await sink.finalize("final answer")
+
+        assert delivered is True
+        assert adapter.created
+        created_card = adapter.created[-1][1]
+        assert created_card["config"]["streaming_mode"] is True
+        assert created_card["body"]["elements"][0]["content"] == ""
+        assert adapter.text_updated == [("card_1", "stream_md", "final answer", 2)]
+        assert not adapter.updated
 
     asyncio.run(run())
 
@@ -207,7 +230,7 @@ def test_sink_tool_progress_schedules_update_before_finalize():
         # Second event triggers an update.
         sink.on_delta("output")
         await sink.drain_pending_updates()
-        assert adapter.updated
+        assert adapter.text_updated
 
     asyncio.run(run())
 
@@ -227,7 +250,7 @@ def test_sink_accepts_delta_from_worker_thread():
         # Second delta triggers an update.
         sink.on_delta(" more text")
         await sink.drain_pending_updates()
-        assert adapter.updated
+        assert adapter.text_updated
 
     asyncio.run(run())
 
@@ -252,8 +275,8 @@ def test_sink_filters_internal_stream_markers_before_render():
 
 def test_sink_disables_card_updates_after_repeated_update_failures():
     class FailingUpdateAdapter(_FakeFeishuCardAdapter):
-        async def update_card_stream_message(self, update_handle, card, sequence=None):
-            self.updated.append((update_handle, card, sequence))
+        async def update_card_stream_text(self, update_handle, element_id, content, sequence=None):
+            self.text_updated.append((update_handle, element_id, content, sequence))
             return SimpleNamespace(success=False, error="update failed")
 
     async def run():
@@ -268,7 +291,7 @@ def test_sink_disables_card_updates_after_repeated_update_failures():
         await sink.drain_pending_updates()
 
         assert sink.card_updates_disabled is True
-        assert len(adapter.updated) == 2
+        assert len(adapter.text_updated) == 2
 
     asyncio.run(run())
 

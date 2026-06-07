@@ -1970,6 +1970,28 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] card stream update failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
+    async def update_card_stream_text(
+        self,
+        update_handle: str,
+        element_id: str,
+        content: str,
+        sequence: Optional[int] = None,
+    ) -> SendResult:
+        """Update a CardKit text element via the streaming text API."""
+        try:
+            ok = await self._update_card_stream_text_transport(
+                update_handle,
+                element_id,
+                content,
+                sequence=sequence,
+            )
+            if ok:
+                return SendResult(success=True)
+            return SendResult(success=False, error="card text update failed")
+        except Exception as exc:
+            logger.warning("[Feishu] card stream text update failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
     async def _create_card_stream_transport(
         self, chat_id: str, card: Dict[str, Any], metadata=None, reply_to=None
     ) -> SendResult:
@@ -2077,6 +2099,44 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
         except Exception as exc:
             logger.warning("[Feishu] card update transport error: %s", exc)
+            return False
+
+    async def _update_card_stream_text_transport(
+        self,
+        update_handle: str,
+        element_id: str,
+        content: str,
+        sequence=None,
+    ) -> bool:
+        """Update a CardKit markdown/plain_text element using the streaming content API."""
+        if not self._client:
+            return False
+        try:
+            from lark_oapi.api.cardkit.v1 import (
+                ContentCardElementRequest,
+                ContentCardElementRequestBody,
+            )
+
+            body = ContentCardElementRequestBody.builder()
+            body.content(content)
+            if sequence is not None:
+                body.sequence(sequence)
+            request = ContentCardElementRequest.builder()
+            request.card_id(update_handle)
+            request.element_id(element_id)
+            request.request_body(body.build())
+            response = await self._client.cardkit.v1.card_element.acontent(request.build())
+            ok = response.success() if hasattr(response, "success") else response.code == 0
+            if not ok:
+                code = getattr(response, "code", None)
+                msg = getattr(response, "msg", None) or getattr(response, "message", None)
+                logger.warning("[Feishu] card text update response failed: code=%s msg=%s", code, msg)
+            return ok
+        except ImportError:
+            logger.warning("[Feishu] cardkit SDK not available for text update")
+            return False
+        except Exception as exc:
+            logger.warning("[Feishu] card text update transport error: %s", exc)
             return False
 
     async def send_exec_approval(

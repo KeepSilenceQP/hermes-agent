@@ -5083,6 +5083,18 @@ class TestFeishuCardStreamTransport(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertIn("card update failed", result.error)
 
+    def test_update_card_stream_text_reports_failure(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._update_card_stream_text_transport = AsyncMock(return_value=False)
+
+        result = asyncio.run(adapter.update_card_stream_text("card_1", "stream_md", "hello", sequence=2))
+
+        self.assertFalse(result.success)
+        self.assertIn("card text update failed", result.error)
+
     @unittest.skipUnless(_HAS_LARK_OAPI, "lark_oapi not installed")
     def test_update_card_stream_transport_sends_card_json_type(self):
         from gateway.config import PlatformConfig
@@ -5111,3 +5123,36 @@ class TestFeishuCardStreamTransport(unittest.TestCase):
         self.assertEqual(body.card.type, "card_json")
         self.assertEqual(json.loads(body.card.data), card)
         self.assertEqual(body.sequence, 7)
+
+    @unittest.skipUnless(_HAS_LARK_OAPI, "lark_oapi not installed")
+    def test_update_card_stream_text_transport_uses_content_endpoint(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        captured = {}
+
+        class _CardElementAPI:
+            async def acontent(self, request):
+                captured["request"] = request
+                return SimpleNamespace(success=lambda: True)
+
+        adapter._client = SimpleNamespace(
+            cardkit=SimpleNamespace(v1=SimpleNamespace(card_element=_CardElementAPI()))
+        )
+
+        ok = asyncio.run(
+            adapter._update_card_stream_text_transport(
+                "7355372766134157313",
+                "stream_md",
+                "hello",
+                sequence=8,
+            )
+        )
+
+        self.assertTrue(ok)
+        request = captured["request"]
+        self.assertEqual(request.card_id, "7355372766134157313")
+        self.assertEqual(request.element_id, "stream_md")
+        self.assertEqual(request.body.content, "hello")
+        self.assertEqual(request.body.sequence, 8)
