@@ -4,8 +4,8 @@
 
 Make Hermes Feishu card streaming match the observable behavior of the Codex
 lark-channel bridge: when a Feishu user mentions 小A, the reply card should open
-early and continuously show process events, including thinking, tool start,
-tool completion, answer deltas, and the final answer.
+early and continuously show process events, including thinking, API/model
+progress, tool start, tool completion, and the final answer.
 
 This is not a final-answer typewriter effect. The card must show the agent's
 run process while the run is still active.
@@ -47,8 +47,8 @@ In scope:
 - Feishu CardKit streaming for 小A.
 - Process events from existing agent callbacks and observable agent lifecycle
   points.
-- Card rendering for thinking, tool started, tool completed, partial answer,
-  and final answer.
+- Card rendering for thinking, API/model progress, tool started, tool completed,
+  partial answer, and final answer.
 - Tests that prove process events update the card before finalization.
 - Focused live validation in the Feishu group.
 
@@ -59,8 +59,6 @@ Out of scope:
 - Reworking provider APIs.
 - Adding button callbacks or interactive form behavior.
 - Persisting full raw tool output in long-term storage.
-- Making API/model progress a first-version acceptance requirement. It can be
-  added only when Hermes exposes structured callback events for it.
 
 ## Design Overview
 
@@ -68,20 +66,15 @@ Introduce a small process-stream layer inside the Feishu card streaming path.
 The layer converts agent progress callbacks into ordered process blocks and
 renders those blocks into one CardKit card.
 
-This layer must be implemented inside the existing `FeishuCardRunSink` contract.
-Do not add a new runner-facing `on_process_event(...)` API unless a later design
-also defines the compatibility migration for existing callers.
-
 Data flow:
 
 ```text
 agent/codex/tool events
   -> gateway.run progress callback
-  -> existing FeishuCardRunSink callbacks
-  -> internal ProcessEvent normalization
-  -> existing FeishuCardRunState reducer/update methods
+  -> FeishuCardRunSink.on_process_event(...)
+  -> ProcessStateReducer
   -> CardKit renderer
-  -> scheduled immediate card update
+  -> immediate update_card
 ```
 
 The process layer should be local to Feishu card streaming. Existing plain text
@@ -89,11 +82,13 @@ fallbacks and non-card paths should keep their current behavior.
 
 ## Components
 
-### Internal Process Event
+### Process Event
 
-Create a normalized process event shape inside the Feishu card sink:
+Create a normalized process event shape for the Feishu card sink:
 
 - `reasoning.available`: thinking or reasoning preview is available.
+- `api_call.started`: model/API call started when that signal is available.
+- `api_call.completed`: model/API call completed when usage or latency is known.
 - `tool.started`: a tool call has begun.
 - `tool.completed`: a tool call has completed or failed.
 - `text.delta`: assistant answer text is streaming.
@@ -102,16 +97,13 @@ Create a normalized process event shape inside the Feishu card sink:
 The initial implementation can use the events already available in Hermes:
 `reasoning.available`, `tool.started`, `tool.completed`, stream deltas, and
 final text. API call blocks can be added from existing conversation-loop
-observability only when the event can be emitted as structured callbacks without
-scraping logs.
+observability only when the event can be emitted without scraping logs.
 
-### Existing Sink State
+### Process State Reducer
 
-Reuse the current `FeishuCardRunSink` and `FeishuCardRunState` shape. The
-implementation should refine the existing queue/drain/reducer behavior instead
-of adding a second reducer beside it.
+Add a reducer owned by `FeishuCardRunSink`.
 
-The state keeps:
+The reducer keeps:
 
 - An ordered list of process blocks.
 - A map from tool call id or stable fallback key to tool block.
@@ -127,42 +119,25 @@ id exists, use a stable fallback of event order, tool name, and start timestamp.
 Render one CardKit 2.0 card with:
 
 - Header or top markdown block for the referenced task summary.
-- Process area for thinking and tools.
+- Process area for thinking, API/model progress, and tools.
 - Answer area for draft/final answer.
 - Footer for model/status metadata when available.
 
 The renderer must not collapse process blocks when final text arrives. Final
 text updates only the answer area.
 
-Tool blocks in the first version must contain only:
+### Immediate Flush
 
-- tool name
-- parameter or command summary
-- running/done/error state
-- short error category or short error summary when the tool failed
-
-They must not render raw tool output. Error summaries must be capped and
-sanitized before display.
-
-### Immediate Process Updates
-
-Tool and reasoning events must schedule a card update immediately after the sink
-mutates state.
+Tool and reasoning events must trigger a card update immediately after the
+reducer mutates state.
 
 Text deltas may still be rate-limited to avoid excessive Feishu updates, but
 process events should bypass the normal text debounce.
 
-The implementation should avoid synchronous waits from the agent worker thread.
-The preferred first-version strategy is to schedule the update onto the gateway
-loop and log whether it completes within the target window. A bounded synchronous
-wait can be used only if the implementation proves it does not block frequent
-tool callbacks under slow Feishu responses.
-
 Expected timing target:
 
 - `tool.started` should result in `feishu_card_update_success` within one
-  second under normal network conditions. This is an observability target, not a
-  promise that the agent callback blocks until success.
+  second under normal network conditions.
 - `tool.completed` should update the existing tool block before the final
   answer is rendered.
 
@@ -174,8 +149,7 @@ Expected timing target:
   failure with the Feishu error code.
 - If a tool completion arrives without a known start block, create a completed
   tool block instead of dropping the event.
-- If tool output is present, do not render the raw output in the card. For
-  failures, render only a capped and sanitized error category or short summary.
+- If tool output is too large, show a preview and mark the block as truncated.
 - If an event cannot be normalized, log it at debug or warning level and keep
   the rest of the stream alive.
 
@@ -183,12 +157,11 @@ Expected timing target:
 
 Add focused logs that explain timing and routing:
 
-- Process event id and monotonic timestamp.
 - Event received by gateway callback.
 - Event accepted by `FeishuCardRunSink`.
 - Reducer mutation result: block type, block count, tool count.
-- Immediate update scheduled.
-- Update completed, failed, or timed out.
+- Immediate flush requested.
+- Flush completed, failed, or timed out.
 - Card update success with sequence, tool count, terminal state, and elapsed
   milliseconds from process event to update.
 
@@ -199,9 +172,6 @@ tool.started routed at T1
 tool.started rendered at T2
 card update success at T3
 ```
-
-The same `event_id` should appear in each log line so live validation does not
-require manually correlating unrelated timestamps.
 
 ## Testing
 
@@ -214,9 +184,6 @@ Add or update focused tests:
 - Final text preserves prior process blocks.
 - Text delta rate limiting does not delay process-event flush.
 - Missing tool start does not drop a tool completion.
-- Raw successful tool output is not rendered.
-- Failed tool output is reduced to a capped sanitized error summary.
-- Existing public sink callbacks remain the runner-facing API.
 
 At least one test should assert that a fake card sink receives an update after
 `tool.started` without calling `finalize()`.
@@ -231,9 +198,7 @@ After implementation and deployment:
 4. Verify a tool-running block appears while the tool is active.
 5. Verify the tool block changes to completed or failed before final answer.
 6. Verify final answer appears without removing process blocks.
-7. Verify there are no separate Feishu progress bubbles.
-8. Verify there is no duplicate final text message.
-9. Check logs for event-to-card-update latency with a shared event id.
+7. Check logs for event-to-card-update latency.
 
 Passing evidence should include both Feishu visual confirmation and log lines
 showing `tool.started` followed by `feishu_card_update_success` before
@@ -242,15 +207,15 @@ showing `tool.started` followed by `feishu_card_update_success` before
 ## Risks
 
 - Feishu update rate limits may reject overly frequent updates. Mitigation:
-  process events schedule immediate updates; text deltas remain rate-limited.
+  process events flush immediately; text deltas remain rate-limited.
 - Card size can grow during long runs. Mitigation: truncate previews and cap
   process blocks.
 - Current callbacks may not expose API call start/completion as structured
   events. Mitigation: implement API blocks only when structured signals exist;
   do not scrape logs.
-- Blocking the agent thread while updating cards can introduce latency.
-  Mitigation: avoid synchronous waits from the agent worker; schedule card
-  updates on the gateway loop and log completion timing.
+- Blocking the agent thread while flushing can introduce latency. Mitigation:
+  avoid synchronous waits from the agent worker; schedule card updates on the
+  gateway loop and log completion timing.
 
 ## Approval Gate
 
