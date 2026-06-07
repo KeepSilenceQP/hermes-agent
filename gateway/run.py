@@ -1544,6 +1544,39 @@ def _should_attach_tool_progress_callback(*, tool_progress_enabled: bool, want_f
     return bool(tool_progress_enabled or want_feishu_card_streaming)
 
 
+def _route_feishu_card_tool_progress(
+    sink: object | None,
+    event_type: str,
+    tool_name: str | None = None,
+    preview: str | None = None,
+    args: dict | None = None,
+    *,
+    logger_obj=None,
+    **kwargs,
+) -> bool:
+    """Route a tool-progress event to the Feishu card sink when one exists."""
+    if sink is None:
+        return False
+    try:
+        sink.on_tool_progress(event_type, tool_name, preview, args, **kwargs)
+        if logger_obj is not None:
+            logger_obj.info(
+                "feishu_card_tool_progress_routed event=%s tool=%s",
+                event_type,
+                tool_name,
+            )
+        return True
+    except Exception:
+        if logger_obj is not None:
+            logger_obj.warning(
+                "feishu_card_tool_progress_route_failed event=%s tool=%s",
+                event_type,
+                tool_name,
+                exc_info=True,
+            )
+        return True
+
+
 def _should_attach_interim_callback(*, want_interim_messages: bool, want_feishu_card_streaming: bool) -> bool:
     """Keep the interim-assistant callback attached when card streaming needs it."""
     return bool(want_interim_messages or want_feishu_card_streaming)
@@ -17166,8 +17199,15 @@ class GatewayRunner:
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
             # Route tool progress through the Feishu card sink when active.
-            if _want_feishu_card_streaming and feishu_card_sink_holder[0] is not None:
-                feishu_card_sink_holder[0].on_tool_progress(event_type, tool_name, preview, args, **kwargs)
+            if _want_feishu_card_streaming and _route_feishu_card_tool_progress(
+                feishu_card_sink_holder[0],
+                event_type,
+                tool_name,
+                preview,
+                args,
+                logger_obj=logger,
+                **kwargs,
+            ):
                 return
             if not progress_queue or not _run_still_current():
                 return
@@ -17999,10 +18039,19 @@ class GatewayRunner:
 
             # Per-message state — callbacks and reasoning config change every
             # turn and must not be baked into the cached agent constructor.
-            agent.tool_progress_callback = progress_callback if _should_attach_tool_progress_callback(
+            _attach_tool_progress_callback = _should_attach_tool_progress_callback(
                 tool_progress_enabled=tool_progress_enabled,
                 want_feishu_card_streaming=_want_feishu_card_streaming,
-            ) else None
+            )
+            agent.tool_progress_callback = progress_callback if _attach_tool_progress_callback else None
+            if _want_feishu_card_streaming:
+                logger.info(
+                    "feishu_card_tool_progress_callback_config attach=%s sink_ready=%s platform=%s session=%s",
+                    _attach_tool_progress_callback,
+                    feishu_card_sink_holder[0] is not None,
+                    platform_key,
+                    session_key,
+                )
             # Discord voice verbal-ack hook (fires once per turn on first tool
             # call; armed only when in a voice channel with the mixer running).
             agent.tool_start_callback = (

@@ -361,7 +361,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 preview = _build_tool_preview(name, args)
                 agent.tool_progress_callback("tool.started", name, preview, args)
             except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
+                logging.warning("Tool progress callback error: %s", cb_err, exc_info=True)
 
     for tc, name, args, block_result, blocked_by_guardrail in parsed_calls:
         if block_result is not None:
@@ -612,7 +612,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         result=function_result,
                     )
                 except Exception as cb_err:
-                    logging.debug(f"Tool progress callback error: {cb_err}")
+                    logging.warning("Tool progress callback error: %s", cb_err, exc_info=True)
 
             if agent.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
@@ -805,7 +805,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 preview = _build_tool_preview(function_name, function_args)
                 agent.tool_progress_callback("tool.started", function_name, preview, function_args)
             except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
+                logging.warning("Tool progress callback error: %s", cb_err, exc_info=True)
 
         if not _execution_blocked and agent.tool_start_callback:
             try:
@@ -1162,7 +1162,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     result=function_result,
                 )
             except Exception as cb_err:
-                logging.debug(f"Tool progress callback error: {cb_err}")
+                logging.warning("Tool progress callback error: %s", cb_err, exc_info=True)
 
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
