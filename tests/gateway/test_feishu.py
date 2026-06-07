@@ -5052,3 +5052,33 @@ class TestChatLockEviction(unittest.TestCase):
                 held.release()
 
         asyncio.run(_run())
+
+
+class TestFeishuCardStreamTransport(unittest.TestCase):
+    def test_create_card_stream_message_returns_update_handle_from_discovered_transport(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._create_card_stream_transport = AsyncMock(
+            return_value=SimpleNamespace(success=True, message_id="om_1", update_handle="om_1")
+        )
+
+        result = asyncio.run(adapter.create_card_stream_message("oc_1", {"schema": "2.0"}))
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.message_id, "om_1")
+        self.assertEqual(result.update_handle, "om_1")
+        adapter._create_card_stream_transport.assert_awaited_once()
+
+    def test_update_card_stream_message_reports_failure(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        adapter._update_card_stream_transport = AsyncMock(return_value=False)
+
+        result = asyncio.run(adapter.update_card_stream_message("om_1", {"schema": "2.0"}))
+
+        self.assertFalse(result.success)
+        self.assertIn("card update failed", result.error)

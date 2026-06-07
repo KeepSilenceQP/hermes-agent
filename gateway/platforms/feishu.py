@@ -1926,6 +1926,117 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    # =========================================================================
+    # CardKit streaming card transport
+    # =========================================================================
+
+    async def create_card_stream_message(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Create a CardKit card and return its update_handle."""
+        try:
+            result = await self._create_card_stream_transport(
+                chat_id=chat_id,
+                card=card,
+                metadata=metadata,
+                reply_to=reply_to,
+            )
+            if result.success:
+                update_handle = (
+                    getattr(result, "update_handle", None)
+                    or getattr(result, "card_id", None)
+                    or getattr(result, "message_id", None)
+                )
+                setattr(result, "update_handle", update_handle)
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] card stream create failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def update_card_stream_message(
+        self, update_handle: str, card: Dict[str, Any], sequence: Optional[int] = None
+    ) -> SendResult:
+        """Update an existing CardKit card via the SDK."""
+        try:
+            ok = await self._update_card_stream_transport(update_handle, card, sequence=sequence)
+            if ok:
+                return SendResult(success=True)
+            return SendResult(success=False, error="card update failed")
+        except Exception as exc:
+            logger.warning("[Feishu] card stream update failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _create_card_stream_transport(
+        self, chat_id: str, card: Dict[str, Any], metadata=None, reply_to=None
+    ) -> SendResult:
+        """Create a CardKit card via the SDK async API.
+
+        Returns the card_id as the update_handle for subsequent updates.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        try:
+            from lark_oapi.api.cardkit.v1 import (
+                CreateCardRequest,
+                CreateCardRequestBody,
+            )
+
+            card_body = CreateCardRequestBody.builder()
+            card_body.type(card.get("schema", "2.0"))
+            card_body.data(json.dumps(card))
+            request = CreateCardRequest.builder()
+            request.request_body(card_body.build())
+            response = await self._client.cardkit.v1.card.acreate(request.build())
+            if response.success() and response.data:
+                card_id = getattr(response.data, "card_id", "")
+                return SendResult(success=True, message_id=card_id, card_id=card_id)
+            return SendResult(
+                success=False,
+                error=f"cardkit create failed: code={response.code} msg={response.msg}",
+            )
+        except ImportError:
+            logger.warning("[Feishu] cardkit SDK not available")
+            return SendResult(success=False, error="cardkit SDK not available")
+        except Exception as exc:
+            logger.warning("[Feishu] card create transport error: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _update_card_stream_transport(
+        self, update_handle: str, card: Dict[str, Any], sequence=None
+    ) -> bool:
+        """Update a CardKit card via the SDK async API."""
+        if not self._client:
+            return False
+        try:
+            from lark_oapi.api.cardkit.v1 import (
+                UpdateCardRequest,
+                UpdateCardRequestBody,
+            )
+            from lark_oapi.api.cardkit.v1.model.card import Card as CardKitCard
+
+            update_card = CardKitCard.builder()
+            update_card.type(card.get("schema", "2.0"))
+            update_card.data(json.dumps(card))
+            update_body = UpdateCardRequestBody.builder()
+            update_body.card(update_card.build())
+            if sequence is not None:
+                update_body.sequence(sequence)
+            request = UpdateCardRequest.builder()
+            request.card_id(update_handle)
+            request.request_body(update_body.build())
+            response = await self._client.cardkit.v1.card.aupdate(request.build())
+            return response.success() if hasattr(response, "success") else response.code == 0
+        except ImportError:
+            logger.warning("[Feishu] cardkit SDK not available for update")
+            return False
+        except Exception as exc:
+            logger.warning("[Feishu] card update transport error: %s", exc)
+            return False
+
     async def send_exec_approval(
         self, chat_id: str, command: str, session_key: str,
         description: str = "dangerous command",
