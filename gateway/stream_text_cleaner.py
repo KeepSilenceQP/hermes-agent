@@ -1,3 +1,14 @@
+"""Shared streaming display text cleanup used by both the existing
+GatewayStreamConsumer and the Feishu CardKit card sink.
+
+Provides:
+  - :func:`clean_stream_display_text` — one-shot cleanup of MEDIA: tags,
+    ``[[audio_as_voice]]`` directives, and excess blank lines.
+  - :class:`StreamDisplayTextFilter` — stateful think-block filter that
+    suppresses ``<think>...</think>`` style reasoning blocks from streamed
+    deltas, with partial-tag buffering and block-boundary detection.
+"""
+
 from __future__ import annotations
 
 import re

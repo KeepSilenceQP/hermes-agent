@@ -108,11 +108,14 @@ class FeishuCardRunSink:
         self.update_interval_sec = update_interval_sec
         self.max_update_failures = max_update_failures
         self._loop = loop
+        # The sink must be constructed inside an async context so drain
+        # scheduling works.  When constructed outside async (tests),
+        # drain_pending_updates() is called synchronously by the test.
         if self._loop is None:
             try:
                 self._loop = asyncio.get_running_loop()
             except RuntimeError:
-                self._loop = None
+                self._loop = None  # ok: test context, drain called manually
         self.state = FeishuCardRunState()
         self.renderer = FeishuCardRunRenderer()
         self.text_filter = StreamDisplayTextFilter()
@@ -294,28 +297,36 @@ class FeishuCardRunSink:
         self._closed = True
         await self.drain_pending_updates()
         self._flush_text_filter_pending()
-        # Use final_text as the authoritative final content, replacing
-        # accumulated streaming text so the card always shows the complete answer.
+        # Append final_text as a new block rather than replacing accumulated
+        # streaming text, so any tool commentary / intermediate content
+        # the user saw during streaming remains visible in the card.
         if final_text:
-            self.state.text_blocks = [clean_stream_display_text(final_text)]
+            cleaned = clean_stream_display_text(final_text)
+            if cleaned:
+                self.state.append_text(cleaned)
         self.state.finalize()
         if await self.flush():
             self.final_response_sent = True
             self.final_content_delivered = True
             return True
-        return await self._send_fallback_text(final_text or "".join(self.state.text_blocks))
+        # Fallback: send accumulated text as plain message.  Use final_text
+        # first, then accumulated blocks, then a hard-coded sentinel.
+        fallback = final_text or "".join(self.state.text_blocks) or "(empty response)"
+        return await self._send_fallback_text(fallback)
 
     async def update_final_after_transform(self, final_text: str) -> bool:
         self._closed = True
         await self.drain_pending_updates()
         self._flush_text_filter_pending()
-        self.state.text_blocks = [final_text] if final_text else self.state.text_blocks
+        if final_text:
+            self.state.text_blocks = [final_text]
         self.state.finalize()
         if self.update_handle and await self.flush():
             self.final_response_sent = True
             self.final_content_delivered = True
             return True
-        return await self._send_fallback_text(final_text)
+        fallback = final_text or "".join(self.state.text_blocks) or "(empty response)"
+        return await self._send_fallback_text(fallback)
 
     async def finish_failed(self, error_text: str) -> bool:
         self._closed = True
@@ -328,4 +339,5 @@ class FeishuCardRunSink:
             self.final_response_sent = True
             self.final_content_delivered = True
             return True
-        return await self._send_fallback_text(error_text)
+        fallback = error_text or "".join(self.state.text_blocks) or "Agent failed"
+        return await self._send_fallback_text(fallback)

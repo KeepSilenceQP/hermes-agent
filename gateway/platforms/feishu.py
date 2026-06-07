@@ -2036,6 +2036,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     return card_id
             return None
         except ImportError:
+            logger.debug("[Feishu] cardkit id_convert not available; using message_id as card update handle")
             return None
         except Exception as exc:
             logger.warning("[Feishu] card_id conversion failed: %s", exc)

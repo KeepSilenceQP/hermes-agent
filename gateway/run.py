@@ -19337,13 +19337,15 @@ class GatewayRunner:
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
             _transformed = bool(response.get("response_transformed"))
-            if not _is_empty_sentinel and not _transformed and (_streamed or _previewed or _content_delivered):
+            _card_delivered = bool(_card_sink and _card_sink_delivered_final(_card_sink))
+            if not _is_empty_sentinel and not _transformed and (_streamed or _previewed or _content_delivered or _card_delivered):
                 logger.info(
-                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
+                    "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s card_delivered=%s).",
                     session_key or "?",
                     _streamed,
                     _previewed,
                     _content_delivered,
+                    _card_delivered,
                 )
                 response["already_sent"] = True
             elif not _is_empty_sentinel and _transformed and _sc is not None:
