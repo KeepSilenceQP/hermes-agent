@@ -19276,7 +19276,6 @@ class GatewayRunner:
         # When card streaming is active, finalize the card before deciding
         # whether the caller should skip its normal send().
         _card_sink = feishu_card_sink_holder[0] if feishu_card_sink_holder else None
-        _card_delivered = _card_sink_delivered_final(_card_sink)
 
         if _card_sink is not None and isinstance(response, dict) and not response.get("failed"):
             _final = response.get("final_response") or ""

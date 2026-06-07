@@ -242,9 +242,15 @@ class FeishuCardRunSink:
             return True
         return False
 
-    async def _ensure_card(self) -> bool:
+    async def _ensure_card(self) -> tuple[bool, bool]:
+        """Ensure a card exists. Returns (success, created_now).
+
+        ``created_now`` is True when the card was just created (first flush).
+        Callers should skip the immediate update in that case because the
+        create call already rendered the current state.
+        """
         if self.update_handle:
-            return True
+            return True, False
         card = self.renderer.render(self.state)
         result = await self.adapter.create_card_stream_message(
             self.chat_id, card, metadata=self.metadata, reply_to=self.reply_to
@@ -256,17 +262,21 @@ class FeishuCardRunSink:
                 or getattr(result, "card_id", None)
                 or getattr(result, "message_id", None)
             )
-            return bool(self.update_handle)
+            return bool(self.update_handle), True
         logger.warning("feishu_card_create_failed")
-        return False
+        return False, False
 
     async def flush(self) -> bool:
         if self.card_updates_disabled:
             return False
         async with self._flush_lock:
             seq = self._sequence = self._sequence + 1
-            if not await self._ensure_card():
+            ok, created_now = await self._ensure_card()
+            if not ok:
                 return False
+            # Card was just created with the current state — no update needed.
+            if created_now:
+                return True
             result = await self.adapter.update_card_stream_message(
                 self.update_handle, self.renderer.render(self.state), sequence=seq
             )
