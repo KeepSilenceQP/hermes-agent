@@ -45,6 +45,13 @@ class FeishuCardRunState:
                 tool.status = "done" if ok else "error"
                 return
 
+    def finish_oldest_running_tool(self, *, tool_name: str, ok: bool = True) -> str | None:
+        for tool in self.tools:
+            if tool.tool_name == tool_name and tool.status == "running":
+                tool.status = "done" if ok else "error"
+                return tool.token
+        return None
+
     def finalize(self) -> None:
         self.terminal = "done"
 

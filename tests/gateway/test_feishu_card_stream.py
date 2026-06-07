@@ -37,3 +37,27 @@ def test_tool_output_is_not_rendered():
 
     assert "SECRET_OUTPUT_SHOULD_NOT_RENDER" not in str(card)
     assert "terminal" in str(card)
+
+
+def test_repeated_same_name_tools_get_distinct_tokens():
+    state = FeishuCardRunState()
+    first = state.start_tool(tool_name="terminal", preview="one")
+    second = state.start_tool(tool_name="terminal", preview="two")
+
+    state.finish_tool(first, ok=True)
+
+    assert first != second
+    assert state.tools[0].status == "done"
+    assert state.tools[1].status == "running"
+
+
+def test_finish_oldest_matching_running_tool_when_no_token():
+    state = FeishuCardRunState()
+    first = state.start_tool(tool_name="terminal", preview="one")
+    second = state.start_tool(tool_name="terminal", preview="two")
+
+    matched = state.finish_oldest_running_tool(tool_name="terminal", ok=False)
+
+    assert matched == first
+    assert state.tools[0].status == "error"
+    assert state.tools[1].status == "running"
