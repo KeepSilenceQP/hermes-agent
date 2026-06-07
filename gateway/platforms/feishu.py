@@ -155,6 +155,8 @@ _MARKDOWN_HINT_RE = re.compile(
     re.MULTILINE,
 )
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_BARE_URL_RE = re.compile(r"https?://[^\s<>\[\]，。；：！？、）\]}》〉”’\"']+")
+_TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？、）)]}》〉”’\"'"
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MENTION_RE = re.compile(r"@_user_\d+")
@@ -557,6 +559,72 @@ def _build_markdown_post_payload(content: str) -> str:
     )
 
 
+def _md_node(text: str) -> Dict[str, str]:
+    return {"tag": "md", "text": text}
+
+
+def _link_node(text: str, href: str) -> Dict[str, str]:
+    return {"tag": "a", "text": text, "href": href}
+
+
+def _append_md_node(nodes: List[Dict[str, str]], text: str) -> None:
+    if not text:
+        return
+    if nodes and nodes[-1].get("tag") == "md":
+        nodes[-1]["text"] = nodes[-1].get("text", "") + text
+        return
+    nodes.append(_md_node(text))
+
+
+def _split_trailing_url_punctuation(url: str) -> tuple[str, str]:
+    trailing = ""
+    while url and url[-1] in _TRAILING_URL_PUNCTUATION:
+        trailing = url[-1] + trailing
+        url = url[:-1]
+    return url, trailing
+
+
+def _build_inline_link_nodes(segment: str) -> List[Dict[str, str]]:
+    """Convert markdown links and bare URLs into Feishu post link nodes."""
+    if not segment:
+        return [_md_node("")]
+
+    nodes: List[Dict[str, str]] = []
+    cursor = 0
+
+    for markdown_match in _MARKDOWN_LINK_RE.finditer(segment):
+        prefix = segment[cursor : markdown_match.start()]
+        _append_bare_url_nodes(nodes, prefix)
+
+        label = markdown_match.group(1)
+        href = markdown_match.group(2).strip()
+        if href.startswith(("http://", "https://")):
+            nodes.append(_link_node(label, href))
+        else:
+            _append_md_node(nodes, markdown_match.group(0))
+        cursor = markdown_match.end()
+
+    _append_bare_url_nodes(nodes, segment[cursor:])
+    return nodes or [_md_node(segment)]
+
+
+def _append_bare_url_nodes(nodes: List[Dict[str, str]], text: str) -> None:
+    cursor = 0
+    for url_match in _BARE_URL_RE.finditer(text):
+        _append_md_node(nodes, text[cursor : url_match.start()])
+
+        raw_url = url_match.group(0)
+        href, trailing = _split_trailing_url_punctuation(raw_url)
+        if href:
+            nodes.append(_link_node(href, href))
+        else:
+            _append_md_node(nodes, raw_url)
+        _append_md_node(nodes, trailing)
+        cursor = url_match.end()
+
+    _append_md_node(nodes, text[cursor:])
+
+
 def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     """Build Feishu post rows while isolating fenced code blocks.
 
@@ -568,19 +636,19 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     if not content:
         return [[{"tag": "md", "text": ""}]]
     if "```" not in content:
-        return [[{"tag": "md", "text": content}]]
+        return [_build_inline_link_nodes(content)]
 
     rows: List[List[Dict[str, str]]] = []
     current: List[str] = []
     in_code_block = False
 
-    def _flush_current() -> None:
+    def _flush_current(*, linkify: bool = True) -> None:
         nonlocal current
         if not current:
             return
         segment = "\n".join(current)
         if segment.strip():
-            rows.append([{"tag": "md", "text": segment}])
+            rows.append(_build_inline_link_nodes(segment) if linkify else [_md_node(segment)])
         current = []
 
     for raw_line in content.splitlines():
@@ -597,7 +665,7 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
             current.append(raw_line)
             in_code_block = not in_code_block
             if not in_code_block:
-                _flush_current()
+                _flush_current(linkify=False)
             continue
 
         current.append(raw_line)

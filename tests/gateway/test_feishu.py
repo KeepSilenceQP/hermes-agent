@@ -2500,7 +2500,45 @@ class TestAdapterBehavior(unittest.TestCase):
         payload = json.loads(adapter._build_post_payload("# 标题\n访问 [文档](https://example.com)"))
 
         elements = payload["zh_cn"]["content"][0]
-        self.assertEqual(elements, [{"tag": "md", "text": "# 标题\n访问 [文档](https://example.com)"}])
+        self.assertEqual(
+            elements,
+            [
+                {"tag": "md", "text": "# 标题\n访问 "},
+                {"tag": "a", "text": "文档", "href": "https://example.com"},
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_post_payload_converts_bare_urls_to_link_nodes(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        payload = json.loads(
+            adapter._build_post_payload(
+                "来源：https://example.com/a?b=1&c=2，更多见 https://blog.example.com/path/."
+            )
+        )
+
+        elements = payload["zh_cn"]["content"][0]
+        self.assertEqual(
+            elements,
+            [
+                {"tag": "md", "text": "来源："},
+                {
+                    "tag": "a",
+                    "text": "https://example.com/a?b=1&c=2",
+                    "href": "https://example.com/a?b=1&c=2",
+                },
+                {"tag": "md", "text": "，更多见 "},
+                {
+                    "tag": "a",
+                    "text": "https://blog.example.com/path/",
+                    "href": "https://blog.example.com/path/",
+                },
+                {"tag": "md", "text": "."},
+            ],
+        )
 
     @patch.dict(os.environ, {}, clear=True)
     def test_build_post_payload_wraps_markdown_in_md_tag(self):
@@ -2701,6 +2739,34 @@ class TestAdapterBehavior(unittest.TestCase):
             [
                 [{"tag": "md", "text": "before"}],
                 [{"tag": "md", "text": "```python\n```oops\n```"}],
+                [{"tag": "md", "text": "after"}],
+            ],
+        )
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_build_post_payload_does_not_linkify_urls_inside_code_blocks(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        payload = json.loads(
+            adapter._build_post_payload(
+                "before https://example.com/outside\n```bash\ncurl https://example.com/inside\n```\nafter"
+            )
+        )
+
+        self.assertEqual(
+            payload["zh_cn"]["content"],
+            [
+                [
+                    {"tag": "md", "text": "before "},
+                    {
+                        "tag": "a",
+                        "text": "https://example.com/outside",
+                        "href": "https://example.com/outside",
+                    },
+                ],
+                [{"tag": "md", "text": "```bash\ncurl https://example.com/inside\n```"}],
                 [{"tag": "md", "text": "after"}],
             ],
         )
