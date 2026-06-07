@@ -107,12 +107,16 @@ def test_sink_delta_schedules_update_before_finalize():
         adapter = _FakeFeishuCardAdapter()
         sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
 
+        # First delta creates the card (no update needed — already current).
         sink.on_delta("streaming")
         await sink.drain_pending_updates()
-
         assert adapter.created
-        assert adapter.updated
         assert sink.final_response_sent is False
+
+        # Second delta triggers an actual update (card already exists).
+        sink.on_delta(" more")
+        await sink.drain_pending_updates()
+        assert adapter.updated
 
     asyncio.run(run())
 
@@ -122,10 +126,14 @@ def test_sink_tool_progress_schedules_update_before_finalize():
         adapter = _FakeFeishuCardAdapter()
         sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
 
+        # First event creates the card.
         sink.on_tool_progress("tool.started", tool_name="exec_command", preview="ls")
         await sink.drain_pending_updates()
-
         assert adapter.created
+
+        # Second event triggers an update.
+        sink.on_delta("output")
+        await sink.drain_pending_updates()
         assert adapter.updated
 
     asyncio.run(run())
@@ -136,12 +144,16 @@ def test_sink_accepts_delta_from_worker_thread():
         adapter = _FakeFeishuCardAdapter()
         sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
 
+        # First delta from worker creates the card.
         worker = threading.Thread(target=lambda: sink.on_delta("from worker"))
         worker.start()
         worker.join(timeout=2)
         await sink.drain_pending_updates()
-
         assert adapter.created
+
+        # Second delta triggers an update.
+        sink.on_delta(" more text")
+        await sink.drain_pending_updates()
         assert adapter.updated
 
     asyncio.run(run())
@@ -155,7 +167,8 @@ def test_sink_filters_internal_stream_markers_before_render():
         sink.on_delta("<think>hidden</think>visible\nMEDIA:/tmp/a.mp3\n[[audio_as_voice]]")
         await sink.drain_pending_updates()
 
-        rendered = str(adapter.updated[-1][1])
+        # First drain only creates the card — check created content.
+        rendered = str(adapter.created[-1][1])
         assert "visible" in rendered
         assert "hidden" not in rendered
         assert "MEDIA:/tmp/a.mp3" not in rendered
