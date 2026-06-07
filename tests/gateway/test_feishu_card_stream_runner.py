@@ -36,6 +36,54 @@ def test_card_streaming_keeps_tool_callback_without_progress_bubbles():
     ) is True
 
 
+def test_route_feishu_card_tool_progress_calls_sink():
+    from gateway.run import _route_feishu_card_tool_progress
+
+    class Sink:
+        def __init__(self):
+            self.calls = []
+
+        def on_tool_progress(self, event_type, tool_name, preview, args, **kwargs):
+            self.calls.append((event_type, tool_name, preview, args, kwargs))
+
+    sink = Sink()
+
+    assert _route_feishu_card_tool_progress(
+        sink,
+        "tool.started",
+        "terminal",
+        "pwd",
+        {"command": "pwd"},
+    ) is True
+    assert sink.calls == [
+        ("tool.started", "terminal", "pwd", {"command": "pwd"}, {})
+    ]
+
+
+def test_route_feishu_card_tool_progress_handles_sink_error(caplog):
+    import logging
+
+    from gateway.run import _route_feishu_card_tool_progress
+
+    class Sink:
+        def on_tool_progress(self, event_type, tool_name, preview, args, **kwargs):
+            raise RuntimeError("boom")
+
+    logger = logging.getLogger("test-feishu-card-route")
+
+    with caplog.at_level(logging.WARNING):
+        assert _route_feishu_card_tool_progress(
+            Sink(),
+            "tool.started",
+            "terminal",
+            "pwd",
+            {},
+            logger_obj=logger,
+        ) is True
+
+    assert "feishu_card_tool_progress_route_failed" in caplog.text
+
+
 def test_card_streaming_keeps_interim_callback_without_interim_messages():
     from gateway.run import _should_attach_interim_callback
 
