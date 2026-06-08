@@ -34,7 +34,7 @@ The implementation must leave behind a replayable patch stack in the work-area r
 - Source Hermes repo: `/Users/bytedance/.hermes/hermes-agent`
 - Implementation worktree: `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/worktrees/hermes-agent`
 - Implementation branch: `qinpeng/feishu-card-streaming`
-- Patch artifacts: `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/patches/feishu-card-streaming-<timestamp>/`
+- Patch artifacts: `/Users/bytedance/Documents/运维/小A补丁/feishu-card-streaming-<timestamp>/`
 
 Rules:
 
@@ -72,7 +72,7 @@ Hermes code paths below are repository-relative logical paths. Implement them un
   - Runner-level tests for the callback wiring and final-send contract.
 - Use `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/worktrees/hermes-agent/`
   - Local clean worktree for this implementation. Do not treat it as the durable artifact.
-- Use `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/patches/feishu-card-streaming-<timestamp>/`
+- Use `/Users/bytedance/Documents/运维/小A补丁/feishu-card-streaming-<timestamp>/`
   - Durable patch artifact directory containing `BASE_COMMIT`, status snapshots, exported commits, and verification notes.
 - Create `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/scripts/export-patches.sh`
   - Re-exports the committed worktree patch stack into the latest patch artifact directory.
@@ -87,7 +87,7 @@ Hermes code paths below are repository-relative logical paths. Implement them un
 
 **Files:**
 - Create or reuse: `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/worktrees/hermes-agent`
-- Create: `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/patches/feishu-card-streaming-<timestamp>/`
+- Create: `/Users/bytedance/Documents/运维/小A补丁/feishu-card-streaming-<timestamp>/`
 - Create: `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/scripts/export-patches.sh`
 - Create: `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/scripts/apply-to-hermes.sh`
 - Create: `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/scripts/verify.sh`
@@ -121,12 +121,12 @@ Run:
 ```bash
 worktree=/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/worktrees/hermes-agent
 ts="$(date +%Y%m%d-%H%M%S)"
-patch_dir="/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/patches/feishu-card-streaming-${ts}"
+patch_dir="/Users/bytedance/Documents/运维/小A补丁/feishu-card-streaming-${ts}"
 
 mkdir -p "$patch_dir/commits"
 git -C "$worktree" rev-parse HEAD > "$patch_dir/BASE_COMMIT"
 git -C "$worktree" status --short > "$patch_dir/status-before.txt"
-printf '%s\n' "$patch_dir" > /Users/bytedance/Documents/运维/hermes-feishu-card-streaming/patches/latest-feishu-card-streaming-dir
+printf '%s\n' "$patch_dir" > /Users/bytedance/Documents/运维/小A补丁/latest-feishu-card-streaming-dir
 ```
 
 Expected:
@@ -144,7 +144,7 @@ Create `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/scripts/e
 set -euo pipefail
 
 worktree=${WORKTREE:-/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/worktrees/hermes-agent}
-latest_file=/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/patches/latest-feishu-card-streaming-dir
+latest_file=/Users/bytedance/Documents/运维/小A补丁/latest-feishu-card-streaming-dir
 patch_dir=${PATCH_DIR:-$(cat "$latest_file")}
 base=${BASE_COMMIT:-$(cat "$patch_dir/BASE_COMMIT")}
 
@@ -170,7 +170,7 @@ Create `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/scripts/a
 set -euo pipefail
 
 target=${1:-/Users/bytedance/.hermes/hermes-agent}
-patch_dir=${2:-$(cat /Users/bytedance/Documents/运维/hermes-feishu-card-streaming/patches/latest-feishu-card-streaming-dir)}
+patch_dir=${2:-$(cat /Users/bytedance/Documents/运维/小A补丁/latest-feishu-card-streaming-dir)}
 
 git -C "$target" status --short
 echo "Applying patch stack from: $patch_dir"
