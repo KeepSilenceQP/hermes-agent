@@ -435,6 +435,8 @@ class FeishuCardRunSink:
                 self._loop = asyncio.get_running_loop()
             except RuntimeError:
                 pass
+        if not self._event_queue.empty():
+            self._drain_events()
         if initial_text and not self.state.has_real_event_content() and self._event_queue.empty():
             self.state.start_placeholder(initial_text)
         if self.update_handle:
