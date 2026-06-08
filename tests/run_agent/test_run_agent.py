@@ -468,6 +468,68 @@ class TestStripThinkBlocks:
         assert "final answer" in result
 
 
+class TestAssistantReasoningProgress:
+    def _agent_with_progress(self, delegate_depth=0):
+        calls = []
+        agent = SimpleNamespace(
+            tool_progress_callback=lambda *args, **kwargs: calls.append((args, kwargs)),
+            _delegate_depth=delegate_depth,
+        )
+        return agent, calls
+
+    def test_root_plain_assistant_content_does_not_emit_reasoning(self):
+        from agent.conversation_loop import _emit_assistant_reasoning_progress
+
+        agent, calls = self._agent_with_progress(delegate_depth=0)
+
+        _emit_assistant_reasoning_progress(
+            agent,
+            _mock_assistant_msg(content="The conclusion is ready; I will verify next."),
+        )
+
+        assert calls == []
+
+    def test_root_inline_reasoning_content_emits_reasoning_available(self):
+        from agent.conversation_loop import _emit_assistant_reasoning_progress
+
+        agent, calls = self._agent_with_progress(delegate_depth=0)
+
+        _emit_assistant_reasoning_progress(
+            agent,
+            _mock_assistant_msg(content="<think>inspect current state</think>\nfinal answer."),
+        )
+
+        assert calls == [
+            (("reasoning.available", "_thinking", "inspect current state", None), {})
+        ]
+
+    def test_root_provider_reasoning_field_emits_reasoning_available(self):
+        from agent.conversation_loop import _emit_assistant_reasoning_progress
+
+        agent, calls = self._agent_with_progress(delegate_depth=0)
+
+        _emit_assistant_reasoning_progress(
+            agent,
+            _mock_assistant_msg(content="Final answer.", reasoning="provider side reasoning"),
+        )
+
+        assert calls == [
+            (("reasoning.available", "_thinking", "provider side reasoning", None), {})
+        ]
+
+    def test_delegate_plain_assistant_content_keeps_thinking_first_line(self):
+        from agent.conversation_loop import _emit_assistant_reasoning_progress
+
+        agent, calls = self._agent_with_progress(delegate_depth=1)
+
+        _emit_assistant_reasoning_progress(
+            agent,
+            _mock_assistant_msg(content="I will inspect the repo first.\nThen summarize."),
+        )
+
+        assert calls == [(("_thinking", "I will inspect the repo first."), {})]
+
+
 class TestExtractReasoning:
     def test_reasoning_field(self, agent):
         msg = _mock_assistant_msg(reasoning="thinking hard")

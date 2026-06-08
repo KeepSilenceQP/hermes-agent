@@ -1523,9 +1523,18 @@ def _should_use_feishu_card_streaming(*, platform_key: str, user_config: dict) -
     if platform_key != "feishu":
         return False
     display = user_config.get("display") if isinstance(user_config, dict) else {}
+    streaming = user_config.get("streaming") if isinstance(user_config, dict) else {}
     platforms = display.get("platforms") if isinstance(display, dict) else {}
     feishu = platforms.get("feishu") if isinstance(platforms, dict) else {}
-    return bool(feishu.get("card_streaming")) if isinstance(feishu, dict) else False
+    return bool(
+        isinstance(display, dict)
+        and display.get("streaming") is True
+        and isinstance(streaming, dict)
+        and streaming.get("enabled") is True
+        and streaming.get("transport", "auto") != "off"
+        and isinstance(feishu, dict)
+        and feishu.get("card_streaming") is True
+    )
 
 
 def _card_sink_delivered_final(sink: object | None) -> bool:
@@ -1537,6 +1546,27 @@ def _card_sink_delivered_final(sink: object | None) -> bool:
         or getattr(sink, "final_content_delivered", False)
         or getattr(sink, "fallback_sent", False)
     )
+
+
+def _should_send_trailing_runtime_footer(*, footer_line: str, agent_result: dict) -> bool:
+    """Return True when streaming still needs a separate footer message."""
+    return bool(footer_line and not agent_result.get("runtime_footer_delivered"))
+
+
+def _emit_feishu_card_lifecycle(sink: object | None, text: str, *, logger_obj: logging.Logger | None = None) -> bool:
+    """Emit an internal lifecycle update through the Feishu card event chain."""
+    if sink is None or not str(text or "").strip():
+        return False
+    try:
+        sink.on_commentary(str(text).strip())
+        flush = getattr(sink, "flush_threadsafe", None)
+        if callable(flush):
+            flush()
+        return True
+    except Exception as exc:
+        log = logger_obj or logger
+        log.debug("feishu_card_lifecycle_emit_failed: %s", exc)
+        return False
 
 
 def _should_attach_tool_progress_callback(*, tool_progress_enabled: bool, want_feishu_card_streaming: bool) -> bool:
@@ -9684,7 +9714,12 @@ class GatewayRunner:
             except Exception as _footer_err:
                 logger.debug("runtime_footer build failed: %s", _footer_err)
                 _footer_line = ""
-            if _footer_line and response and not agent_result.get("already_sent"):
+            if (
+                _footer_line
+                and response
+                and not agent_result.get("already_sent")
+                and not agent_result.get("runtime_footer_delivered")
+            ):
                 response = f"{response}\n\n{_footer_line}"
 
             # Emit agent:end hook
@@ -9925,7 +9960,10 @@ class GatewayRunner:
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
                 # still surface the runtime metadata on the final reply.
-                if _footer_line:
+                if _should_send_trailing_runtime_footer(
+                    footer_line=_footer_line,
+                    agent_result=agent_result,
+                ):
                     try:
                         _foot_adapter = self.adapters.get(source.platform)
                         if _foot_adapter:
@@ -17864,9 +17902,20 @@ class GatewayRunner:
                             chat_id=source.chat_id,
                             metadata=_status_thread_metadata,
                             reply_to=event_message_id,
+                            loop=_loop_for_step,
                         )
+
+                        async def _start_feishu_card_sink_with_lifecycle(_sink):
+                            await _sink.start()
+                            _emit_feishu_card_lifecycle(
+                                _sink,
+                                "已收到请求，正在准备上下文。",
+                                logger_obj=logger,
+                            )
+                            await _sink.drain_pending_updates()
+
                         safe_schedule_threadsafe(
-                            feishu_card_sink_holder[0].start(),
+                            _start_feishu_card_sink_with_lifecycle(feishu_card_sink_holder[0]),
                             _loop_for_step,
                             logger=logger,
                             log_message="Feishu card sink start scheduling error",
@@ -17949,7 +17998,10 @@ class GatewayRunner:
                     return
                 # Route interim commentary through the Feishu card sink when active.
                 if _want_feishu_card_streaming and feishu_card_sink_holder[0] is not None:
-                    feishu_card_sink_holder[0].on_commentary(text)
+                    feishu_card_sink_holder[0].on_commentary(
+                        text,
+                        already_streamed=already_streamed,
+                    )
                     return
                 if _stream_consumer is not None:
                     if already_streamed:
@@ -18072,6 +18124,18 @@ class GatewayRunner:
             agent.reasoning_config = reasoning_config
             agent.service_tier = self._service_tier
             agent.request_overrides = turn_route.get("request_overrides") or {}
+            if _want_feishu_card_streaming:
+                history_count = len(history) if isinstance(history, list) else 0
+                model_waiting_text = (
+                    f"正在请求模型，等待首个事件。（历史 {history_count} 条）"
+                    if history_count >= 20
+                    else "正在请求模型，等待首个事件。"
+                )
+                _emit_feishu_card_lifecycle(
+                    feishu_card_sink_holder[0],
+                    model_waiting_text,
+                    logger_obj=logger,
+                )
 
             _bg_review_release = threading.Event()
             _bg_review_pending: list[str] = []
@@ -19344,18 +19408,37 @@ class GatewayRunner:
             if _is_empty_sentinel:
                 # Empty response — let the normal path handle it.
                 pass
-            elif response.get("response_transformed"):
-                try:
-                    if await _card_sink.update_final_after_transform(_final):
-                        response["already_sent"] = True
-                except Exception as _card_err:
-                    logger.warning("Feishu card transform update failed: %s", _card_err)
             else:
+                _card_footer_line = ""
                 try:
-                    if await _card_sink.finalize(_final):
-                        response["already_sent"] = True
-                except Exception as _card_err:
-                    logger.warning("Feishu card finalize failed: %s", _card_err)
+                    from gateway.runtime_footer import build_footer_line as _bfl
+                    _card_footer_line = _bfl(
+                        user_config=_load_gateway_config(),
+                        platform_key=_platform_config_key(source.platform),
+                        model=response.get("model"),
+                        context_tokens=response.get("last_prompt_tokens", 0) or 0,
+                        context_length=response.get("context_length") or None,
+                        cwd=os.environ.get("TERMINAL_CWD", ""),
+                    )
+                except Exception as _footer_err:
+                    logger.debug("runtime_footer build for Feishu card failed: %s", _footer_err)
+                    _card_footer_line = ""
+                if _card_footer_line:
+                    _card_sink.on_footer(_card_footer_line)
+                    await _card_sink.drain_pending_updates()
+                    response["runtime_footer_delivered"] = True
+                if response.get("response_transformed"):
+                    try:
+                        if await _card_sink.update_final_after_transform(_final):
+                            response["already_sent"] = True
+                    except Exception as _card_err:
+                        logger.warning("Feishu card transform update failed: %s", _card_err)
+                else:
+                    try:
+                        if await _card_sink.finalize(_final):
+                            response["already_sent"] = True
+                    except Exception as _card_err:
+                        logger.warning("Feishu card finalize failed: %s", _card_err)
         elif _card_sink is not None and isinstance(response, dict) and response.get("failed"):
             error_text = (
                 response.get("final_response")
