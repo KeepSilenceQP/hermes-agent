@@ -17904,18 +17904,18 @@ class GatewayRunner:
                             reply_to=event_message_id,
                             loop=_loop_for_step,
                         )
+                        _emit_feishu_card_lifecycle(
+                            feishu_card_sink_holder[0],
+                            "已收到请求，正在准备上下文。",
+                            logger_obj=logger,
+                        )
 
-                        async def _start_feishu_card_sink_with_lifecycle(_sink):
+                        async def _start_feishu_card_sink(_sink):
                             await _sink.start()
-                            _emit_feishu_card_lifecycle(
-                                _sink,
-                                "已收到请求，正在准备上下文。",
-                                logger_obj=logger,
-                            )
                             await _sink.drain_pending_updates()
 
                         safe_schedule_threadsafe(
-                            _start_feishu_card_sink_with_lifecycle(feishu_card_sink_holder[0]),
+                            _start_feishu_card_sink(feishu_card_sink_holder[0]),
                             _loop_for_step,
                             logger=logger,
                             log_message="Feishu card sink start scheduling error",

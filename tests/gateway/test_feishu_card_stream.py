@@ -394,6 +394,26 @@ def test_sink_late_start_does_not_restore_placeholder_after_real_event():
     asyncio.run(run())
 
 
+def test_sink_start_reduces_queued_lifecycle_before_creating_card():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        sink.on_commentary("已收到请求，正在准备上下文。")
+        sink.on_commentary("正在请求模型，等待首个事件。")
+
+        started = await sink.start("正在处理...")
+
+        assert started is True
+        created_content = adapter.created[-1][1]["body"]["elements"][0]["content"]
+        assert created_content.index("已收到请求，正在准备上下文。") < created_content.index(
+            "正在请求模型，等待首个事件。"
+        )
+        assert "正在处理..." not in created_content
+
+    asyncio.run(run())
+
+
 def test_sink_routes_thinking_progress_to_process_blocks():
     async def run():
         adapter = _FakeFeishuCardAdapter()
