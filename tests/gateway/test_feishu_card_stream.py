@@ -17,8 +17,8 @@ def test_renderer_streaming_card_contains_text_and_running_tool():
             "tag": "markdown",
             "element_id": "stream_md",
             "content": (
-                "> ⏳ **command_execution** — `rg card_streaming`\n\n"
                 "I will inspect the repo.\n\n"
+                "> ⏳ **command_execution** — `rg card_streaming`\n\n"
                 "_calling tools_"
             ),
         }
@@ -54,6 +54,29 @@ def test_tool_output_is_not_rendered():
     assert "✅" in str(card)
 
 
+def test_error_tool_output_keeps_every_line_inside_quote_block():
+    state = FeishuCardRunState()
+    token = state.start_tool(
+        tool_name="web_extract",
+        preview="https://www.anthropic.com/news/context-management",
+    )
+    state.finish_tool(
+        token,
+        ok=False,
+        output='{\n"results": [\n{"error": "Payment Required"}\n]\n}',
+    )
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "❌ **web_extract**" in content
+    assert "> **Output**" in content
+    assert "```" not in content
+    assert "> {" in content
+    assert '> "results": [' in content
+    assert '> {"error": "Payment Required"}' in content
+    assert "\n\"results\"" not in content
+
+
 def test_repeated_same_name_tools_get_distinct_tokens():
     state = FeishuCardRunState()
     first = state.start_tool(tool_name="terminal", preview="one")
@@ -78,8 +101,116 @@ def test_finish_oldest_matching_running_tool_when_no_token():
     assert state.tools[1].status == "running"
 
 
+def test_reducer_hides_placeholder_after_first_real_event():
+    state = FeishuCardRunState()
+    state.start_placeholder("正在处理...")
+
+    assert FeishuCardRunRenderer().content(state, include_running_status=False) == "正在处理..."
+
+    state.append_text("visible answer")
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert "正在处理..." not in content
+    assert "visible answer" in content
+
+
+def test_reducer_final_removes_placeholder_and_renders_answer_once():
+    state = FeishuCardRunState()
+    state.start_placeholder("正在处理...")
+    state.append_text("draft answer")
+
+    state.finalize("final answer")
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert "正在处理..." not in content
+    assert "draft answer" not in content
+    assert content.count("final answer") == 1
+
+
+def test_reducer_suppresses_commentary_that_duplicates_final_answer():
+    state = FeishuCardRunState()
+    final = "结论：工具链应该使用事件流 reducer。"
+    state.append_commentary(f"  {final}  ")
+
+    state.finalize(final)
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert content.count(final) == 1
+
+
+def test_reducer_updates_same_name_tools_by_tool_key():
+    state = FeishuCardRunState()
+    state.start_tool(tool_key="call-1", tool_name="terminal", preview="pwd")
+    state.start_tool(tool_key="call-2", tool_name="terminal", preview="ls")
+
+    state.finish_tool("call-2", ok=True)
+
+    assert state.tools[0].status == "running"
+    assert state.tools[1].status == "done"
+    assert state.tools[0].tool_key == "call-1"
+    assert state.tools[1].tool_key == "call-2"
+
+
+def test_reducer_delta_tool_delta_final_has_one_answer_source():
+    state = FeishuCardRunState()
+    state.append_text("draft part one")
+    state.start_tool(tool_key="call-1", tool_name="terminal", preview="pwd")
+    state.append_text(" draft part two")
+
+    state.finalize("final answer")
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert "draft part one" not in content
+    assert "draft part two" not in content
+    assert content.count("final answer") == 1
+    assert "command_execution" in content
+    assert "pwd" in content
+
+
+def test_model_text_before_tool_commits_as_process_not_answer():
+    state = FeishuCardRunState()
+
+    state.append_model_text("我先查官方输出。")
+    state.start_tool(tool_key="call-1", tool_name="web_search", preview="site:openai.com memory")
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert "我先查官方输出。" in content
+    assert "web_search" in content
+    assert any(
+        block.kind == "process" and "我先查官方输出。" in block.content
+        for block in state.blocks
+    )
+    assert not any(block.kind == "answer" for block in state.blocks)
+
+
+def test_already_streamed_interim_segment_does_not_render_duplicate_commentary():
+    state = FeishuCardRunState()
+
+    state.append_model_text("我先查官方输出。")
+    state.close_interim_segment("我先查官方输出。", already_streamed=True)
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert content.count("我先查官方输出。") == 1
+
+
+def test_final_answer_renders_after_tools_even_when_model_text_arrived_first():
+    state = FeishuCardRunState()
+
+    state.append_model_text("我先查官方输出。")
+    state.start_tool(tool_key="call-1", tool_name="web_search", preview="site:openai.com memory")
+    state.finish_tool("call-1", ok=True)
+    state.finalize("结论：OpenAI 和 Anthropic 都在强化 Agent Memory。")
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert content.count("结论：OpenAI 和 Anthropic 都在强化 Agent Memory。") == 1
+    assert content.index("web_search") < content.index(
+        "结论：OpenAI 和 Anthropic 都在强化 Agent Memory。"
+    )
+
+
 import asyncio
 import threading
+import time
 from types import SimpleNamespace
 
 from gateway.platforms.feishu_card_stream import FeishuCardRunSink
@@ -192,7 +323,9 @@ def test_sink_finalize_replaces_compact_streamed_block_with_final_text():
         delivered = await sink.finalize(final_text)
 
         assert delivered is True
-        rendered_content = adapter.text_updated[-1][2]
+        assert adapter.updated
+        final_card = adapter.updated[-1][1]
+        rendered_content = final_card["body"]["elements"][0]["content"]
         assert rendered_content == final_text
         assert compact not in rendered_content
 
@@ -211,8 +344,12 @@ def test_sink_finalize_without_prior_delta_creates_empty_streaming_card_then_tex
         created_card = adapter.created[-1][1]
         assert created_card["config"]["streaming_mode"] is True
         assert created_card["body"]["elements"][0]["content"] == ""
-        assert adapter.text_updated == [("card_1", "stream_md", "final answer", 2)]
-        assert not adapter.updated
+        # Terminal flush goes through full card update (update_card_stream_message)
+        assert adapter.updated
+        final_card = adapter.updated[-1][1]
+        final_content = final_card["body"]["elements"][0]["content"]
+        assert final_content == "final answer"
+        assert final_card["config"]["streaming_mode"] is False
 
     asyncio.run(run())
 
@@ -227,8 +364,32 @@ def test_sink_start_creates_process_card_and_finalize_appends_answer():
 
         assert started is True
         assert delivered is True
+        # start() uses start_placeholder, so the initial text appears in the created card
         assert "正在处理..." in adapter.created[-1][1]["body"]["elements"][0]["content"]
-        assert adapter.text_updated[-1][2] == "正在处理...\n\nfinal answer"
+        # Terminal flush goes through full card update — placeholder is cleared by finalize
+        assert adapter.updated
+        final_card = adapter.updated[-1][1]
+        final_content = final_card["body"]["elements"][0]["content"]
+        assert "正在处理..." not in final_content
+        assert final_content == "final answer"
+
+    asyncio.run(run())
+
+
+def test_sink_late_start_does_not_restore_placeholder_after_real_event():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        sink.on_delta("real answer")
+        await sink.drain_pending_updates()
+
+        started = await sink.start("正在处理...")
+
+        assert started is True
+        created_content = adapter.created[-1][1]["body"]["elements"][0]["content"]
+        assert "real answer" in created_content
+        assert "正在处理..." not in created_content
 
     asyncio.run(run())
 
@@ -266,21 +427,115 @@ def test_sink_tool_progress_schedules_update_before_finalize():
 
 
 def test_sink_flush_threadsafe_updates_tool_progress_before_finalize():
+    class SlowUpdateAdapter(_FakeFeishuCardAdapter):
+        async def update_card_stream_text(self, update_handle, element_id, content, sequence=None):
+            await asyncio.sleep(0.2)
+            return await super().update_card_stream_text(update_handle, element_id, content, sequence=sequence)
+
     async def run():
-        adapter = _FakeFeishuCardAdapter()
+        adapter = SlowUpdateAdapter()
         sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=60)
 
         await sink.start("正在处理...")
 
         def worker():
             sink.on_tool_progress("tool.started", tool_name="terminal", preview="pwd")
-            return sink.flush_threadsafe(timeout_sec=2)
+            started_at = time.monotonic()
+            accepted = sink.flush_threadsafe(timeout_sec=2)
+            return accepted, time.monotonic() - started_at
 
-        assert await asyncio.to_thread(worker) is True
+        accepted, elapsed = await asyncio.to_thread(worker)
+        assert accepted is True
+        assert elapsed < 0.1
+        assert not adapter.text_updated
 
+        for _ in range(20):
+            if adapter.text_updated:
+                break
+            await asyncio.sleep(0.05)
         assert adapter.text_updated
         assert "command_execution" in adapter.text_updated[-1][2]
         assert "pwd" in adapter.text_updated[-1][2]
+        assert sink.final_response_sent is False
+
+    asyncio.run(run())
+
+
+def test_sink_worker_thread_process_event_updates_before_finalize():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=60)
+        await sink.start("正在处理...")
+
+        ready = threading.Event()
+
+        def emit_tool():
+            sink.on_tool_progress(
+                "tool.started",
+                tool_name="terminal",
+                preview="pwd",
+                tool_call_id="call-1",
+            )
+            ready.set()
+
+        worker = threading.Thread(target=emit_tool)
+        worker.start()
+        assert ready.wait(2)
+        worker.join(timeout=2)
+
+        for _ in range(20):
+            if adapter.text_updated:
+                break
+            await asyncio.sleep(0.05)
+
+        assert adapter.text_updated
+        content = adapter.text_updated[-1][2]
+        assert "command_execution" in content
+        assert "pwd" in content
+        assert "正在处理..." not in content
+
+    asyncio.run(run())
+
+
+def test_sink_created_in_worker_thread_uses_explicit_loop_for_realtime_updates():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        loop = asyncio.get_running_loop()
+        sink = await asyncio.to_thread(
+            lambda: FeishuCardRunSink(
+                adapter=adapter,
+                chat_id="oc_1",
+                update_interval_sec=60,
+                loop=loop,
+            )
+        )
+        await sink.start("正在处理...")
+
+        ready = threading.Event()
+
+        def emit_tool():
+            sink.on_tool_progress(
+                "tool.started",
+                tool_name="terminal",
+                preview="pwd",
+                tool_call_id="call-worker-loop",
+            )
+            ready.set()
+
+        worker = threading.Thread(target=emit_tool)
+        worker.start()
+        assert ready.wait(2)
+        worker.join(timeout=2)
+
+        for _ in range(20):
+            if adapter.text_updated:
+                break
+            await asyncio.sleep(0.05)
+
+        assert adapter.text_updated
+        content = adapter.text_updated[-1][2]
+        assert "command_execution" in content
+        assert "pwd" in content
         assert sink.final_response_sent is False
 
     asyncio.run(run())
@@ -362,3 +617,153 @@ def test_sink_card_create_failure_falls_back_to_text():
     assert sink.fallback_sent is True
     assert sink.final_response_sent is True
     assert adapter.sent_text == [("oc_1", "visible answer", None, "om_parent")]
+
+
+def test_sink_tool_progress_matches_completion_by_tool_call_id():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        sink.on_tool_progress("tool.started", tool_name="terminal", preview="pwd", tool_call_id="call-1")
+        sink.on_tool_progress("tool.started", tool_name="terminal", preview="ls", tool_call_id="call-2")
+        sink.on_tool_progress("tool.completed", tool_name="terminal", tool_call_id="call-2")
+        await sink.drain_pending_updates()
+
+        assert sink.state.tools[0].status == "running"
+        assert sink.state.tools[1].status == "done"
+
+    asyncio.run(run())
+
+
+def test_sink_tool_progress_legacy_completion_uses_oldest_running_tool():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        sink.on_tool_progress("tool.started", tool_name="terminal", preview="pwd")
+        sink.on_tool_progress("tool.completed", tool_name="terminal")
+        await sink.drain_pending_updates()
+
+        assert sink.state.tools[0].status == "done"
+
+    asyncio.run(run())
+
+
+def test_tool_progress_completion_without_key_is_logged_as_degraded(caplog):
+    import logging
+
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+        sink.on_tool_progress("tool.started", tool_name="terminal", preview="pwd", tool_call_id="call-1")
+        sink.on_tool_progress("tool.completed", tool_name="terminal")
+        await sink.drain_pending_updates()
+
+    with caplog.at_level(logging.WARNING):
+        asyncio.run(run())
+
+    assert "feishu_card_tool_progress_missing_key" in caplog.text
+
+
+def test_sink_reduces_tool_event_queued_before_final():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=60)
+
+        await sink.start("正在处理...")
+        sink.on_tool_progress("tool.started", tool_name="terminal", preview="pwd", tool_call_id="call-1")
+
+        delivered = await sink.finalize("final answer")
+
+        assert delivered is True
+        assert adapter.updated
+        final_card = adapter.updated[-1][1]
+        final_content = final_card["body"]["elements"][0]["content"]
+        assert "command_execution" in final_content
+        assert "pwd" in final_content
+        assert "正在处理..." not in final_content
+        assert final_content.count("final answer") == 1
+
+    asyncio.run(run())
+
+
+def test_sink_final_card_uses_full_card_update_to_disable_streaming():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        await sink.start("正在处理...")
+        delivered = await sink.finalize("final answer")
+
+        assert delivered is True
+        assert adapter.updated
+        final_card = adapter.updated[-1][1]
+        assert final_card["config"]["streaming_mode"] is False
+        assert "正在处理..." not in str(final_card)
+        assert str(final_card).count("final answer") == 1
+
+    asyncio.run(run())
+
+
+def test_sink_terminal_update_uses_higher_sequence_than_prior_text_updates():
+    class SequenceAdapter(_FakeFeishuCardAdapter):
+        async def update_card_stream_text(self, update_handle, element_id, content, sequence=None):
+            self.text_updated.append((update_handle, element_id, content, sequence))
+            await asyncio.sleep(0.01)
+            return SimpleNamespace(success=True)
+
+        async def update_card_stream_message(self, update_handle, card, sequence=None):
+            self.updated.append((update_handle, card, sequence))
+            return SimpleNamespace(success=True)
+
+    async def run():
+        adapter = SequenceAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        sink.on_delta("draft")
+        await sink.drain_pending_updates()
+        sink.on_delta(" still draft")
+        await sink.drain_pending_updates()
+
+        delivered = await sink.finalize("final answer")
+
+        assert delivered is True
+        assert adapter.text_updated
+        assert adapter.updated
+        max_text_seq = max(item[3] for item in adapter.text_updated)
+        final_seq = adapter.updated[-1][2]
+        assert final_seq > max_text_seq
+        final_card = adapter.updated[-1][1]
+        assert final_card["config"]["streaming_mode"] is False
+        assert str(final_card).count("final answer") == 1
+
+    asyncio.run(run())
+
+
+def test_sink_sequence_placeholder_tool_final_matches_user_visible_contract():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_1", update_interval_sec=0)
+
+        await sink.start("正在处理...")
+        created_content = adapter.created[-1][1]["body"]["elements"][0]["content"]
+        assert "正在处理..." in created_content
+
+        sink.on_tool_progress("tool.started", tool_name="terminal", preview="pwd", tool_call_id="call-1")
+        await sink.drain_pending_updates()
+        tool_content = adapter.text_updated[-1][2]
+        assert "正在处理..." not in tool_content
+        assert "command_execution" in tool_content
+        assert "pwd" in tool_content
+
+        delivered = await sink.finalize("final answer")
+
+        assert delivered is True
+        final_card = adapter.updated[-1][1]
+        assert final_card["config"]["streaming_mode"] is False
+        final_rendered = str(final_card)
+        assert "正在处理..." not in final_rendered
+        assert final_rendered.count("final answer") == 1
+        assert "command_execution" in final_rendered
+
+    asyncio.run(run())

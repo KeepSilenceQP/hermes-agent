@@ -64,6 +64,79 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+_INLINE_REASONING_BLOCK_RE = re.compile(
+    r"<(think|reasoning|REASONING_SCRATCHPAD)\b[^>]*>(.*?)</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_INLINE_REASONING_TAG_RE = re.compile(
+    r"</?(?:REASONING_SCRATCHPAD|think|reasoning)\b[^>]*>",
+    re.IGNORECASE,
+)
+
+
+def _coerce_reasoning_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts: list[str] = []
+        for item in value:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                for key in ("text", "summary", "content", "reasoning"):
+                    text = item.get(key)
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text)
+                        break
+        return "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+    if isinstance(value, dict):
+        for key in ("text", "summary", "content", "reasoning"):
+            text = value.get(key)
+            if isinstance(text, str) and text.strip():
+                return text.strip()
+    return str(value).strip()
+
+
+def _assistant_reasoning_progress_text(assistant_message: Any) -> str:
+    for field in ("reasoning", "reasoning_content", "reasoning_details"):
+        text = _coerce_reasoning_text(getattr(assistant_message, field, None))
+        if text:
+            return text
+
+    content = getattr(assistant_message, "content", None)
+    if not isinstance(content, str) or not content:
+        return ""
+
+    parts = [match.group(2).strip() for match in _INLINE_REASONING_BLOCK_RE.finditer(content)]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _emit_assistant_reasoning_progress(agent: Any, assistant_message: Any) -> None:
+    callback = getattr(agent, "tool_progress_callback", None)
+    if not callback:
+        return
+
+    content = getattr(assistant_message, "content", None)
+    if isinstance(content, str) and content and getattr(agent, "_delegate_depth", 0) > 0:
+        think_text = _INLINE_REASONING_TAG_RE.sub("", content.strip()).strip()
+        first_line = think_text.split("\n")[0][:80] if think_text else ""
+        if first_line:
+            try:
+                callback("_thinking", first_line)
+            except Exception:
+                pass
+        return
+
+    reasoning_text = _assistant_reasoning_progress_text(assistant_message)
+    if reasoning_text:
+        try:
+            callback("reasoning.available", "_thinking", reasoning_text[:500], None)
+        except Exception:
+            pass
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -3670,27 +3743,9 @@ def run_conversation(
                 else:
                     agent._vprint(f"{agent.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
-            # Notify progress callback of model's thinking (used by subagent
-            # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
-                _think_text = assistant_message.content.strip()
-                # Strip reasoning XML tags that shouldn't leak to parent display
-                _think_text = re.sub(
-                    r'</?(?:REASONING_SCRATCHPAD|think|reasoning)>', '', _think_text
-                ).strip()
-                # For subagents: relay first line to parent display (existing behaviour).
-                # For all agents with a structured callback: emit reasoning.available event.
-                first_line = _think_text.split('\n')[0][:80] if _think_text else ""
-                if first_line and getattr(agent, '_delegate_depth', 0) > 0:
-                    try:
-                        agent.tool_progress_callback("_thinking", first_line)
-                    except Exception:
-                        pass
-                elif _think_text:
-                    try:
-                        agent.tool_progress_callback("reasoning.available", "_thinking", _think_text[:500], None)
-                    except Exception:
-                        pass
+            # Relay delegated child progress, and expose only true reasoning
+            # (provider reasoning fields or explicit inline reasoning blocks).
+            _emit_assistant_reasoning_progress(agent, assistant_message)
             
             # Check for incomplete <REASONING_SCRATCHPAD> (opened but never closed)
             # This means the model ran out of output tokens mid-reasoning — retry up to 2 times

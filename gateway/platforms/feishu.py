@@ -1527,6 +1527,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._media_batch_state = FeishuBatchState()
         self._pending_media_batches = self._media_batch_state.events
         self._pending_media_batch_tasks = self._media_batch_state.tasks
+        self._last_cardkit_create_error: str | None = None
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
@@ -1949,7 +1950,6 @@ class FeishuAdapter(BasePlatformAdapter):
                 update_handle = (
                     getattr(result, "update_handle", None)
                     or getattr(result, "card_id", None)
-                    or getattr(result, "message_id", None)
                 )
                 setattr(result, "update_handle", update_handle)
             return result
@@ -1995,7 +1995,7 @@ class FeishuAdapter(BasePlatformAdapter):
     async def _create_card_stream_transport(
         self, chat_id: str, card: Dict[str, Any], metadata=None, reply_to=None
     ) -> SendResult:
-        """Send a CardKit card as an interactive message to the chat.
+        """Create a CardKit-managed card and send a card_id reference to the chat.
 
         Returns both ``message_id`` (visible Feishu message) and ``card_id``
         (CardKit entity handle for subsequent streaming updates).
@@ -2003,8 +2003,15 @@ class FeishuAdapter(BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
-            # Send card as interactive message so it is visible in the chat.
-            payload = json.dumps(card, ensure_ascii=False)
+            card_id = await self._create_cardkit_card(card)
+            if not card_id:
+                error = self._last_cardkit_create_error or "cardkit.card.create returned no card_id"
+                return SendResult(success=False, error=error)
+
+            payload = json.dumps(
+                {"type": "card", "data": {"card_id": card_id}},
+                ensure_ascii=False,
+            )
             response = await self._feishu_send_with_retry(
                 chat_id=chat_id,
                 msg_type="interactive",
@@ -2019,12 +2026,11 @@ class FeishuAdapter(BasePlatformAdapter):
             if not message_id:
                 return SendResult(success=False, error="card stream create: no message_id in response")
 
-            # Convert message_id to CardKit card_id for subsequent streaming updates.
-            card_id = await self._convert_message_id_to_card_id(message_id)
+            logger.info("[Feishu] card stream managed create: card_id=%s message_id=%s", card_id, message_id)
             return SendResult(
                 success=True,
                 message_id=message_id,
-                card_id=card_id or message_id,
+                card_id=card_id,
                 raw_response=response,
             )
         except ImportError:
@@ -2034,6 +2040,40 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] card create transport error: %s", exc)
             return SendResult(success=False, error=str(exc))
 
+    async def _create_cardkit_card(self, card: Dict[str, Any]) -> str | None:
+        from lark_oapi.api.cardkit.v1 import (
+            CreateCardRequest,
+            CreateCardRequestBody,
+        )
+
+        self._last_cardkit_create_error = None
+        body = CreateCardRequestBody.builder()
+        body.type("card_json")
+        body.data(json.dumps(card, ensure_ascii=False))
+
+        request = CreateCardRequest.builder()
+        request.request_body(body.build())
+
+        card_api = self._client.cardkit.v1.card
+        built_request = request.build()
+        if hasattr(card_api, "acreate"):
+            response = await card_api.acreate(built_request)
+        else:
+            response = card_api.create(built_request)
+        ok = response.success() if hasattr(response, "success") else response.code == 0
+        if not ok:
+            code = getattr(response, "code", None)
+            msg = getattr(response, "msg", None) or getattr(response, "message", None)
+            self._last_cardkit_create_error = f"cardkit.card.create failed code={code} msg={msg or ''}".strip()
+            logger.warning("[Feishu] card create response failed: code=%s msg=%s", code, msg)
+            return None
+        card_id = getattr(response.data, "card_id", "") if response.data else ""
+        if not card_id:
+            self._last_cardkit_create_error = "cardkit.card.create returned no card_id"
+        return card_id
+
+    # Legacy fallback only. New card-stream messages are created as CardKit
+    # managed cards and already have card_id from cardkit.card.create.
     async def _convert_message_id_to_card_id(self, message_id: str) -> str | None:
         """Convert an IM message_id to a CardKit card_id via the id_convert API.
 
@@ -2058,7 +2098,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     return card_id
             return None
         except ImportError:
-            logger.debug("[Feishu] cardkit id_convert not available; using message_id as card update handle")
+            logger.debug("[Feishu] cardkit id_convert not available for legacy card lookup")
             return None
         except Exception as exc:
             logger.warning("[Feishu] card_id conversion failed: %s", exc)

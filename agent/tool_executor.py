@@ -359,7 +359,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         if agent.tool_progress_callback:
             try:
                 preview = _build_tool_preview(name, args)
-                agent.tool_progress_callback("tool.started", name, preview, args)
+                agent.tool_progress_callback(
+                    "tool.started",
+                    name,
+                    preview,
+                    args,
+                    tool_call_id=getattr(tc, "id", "") or "",
+                )
             except Exception as cb_err:
                 logging.warning("Tool progress callback error: %s", cb_err, exc_info=True)
 
@@ -577,6 +583,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     error_message=function_result,
                 )
             tool_duration = 0.0
+            if agent.tool_progress_callback:
+                try:
+                    agent.tool_progress_callback(
+                        "tool.completed",
+                        name,
+                        None,
+                        None,
+                        duration=tool_duration,
+                        is_error=True,
+                        result=function_result,
+                        tool_call_id=getattr(tc, "id", "") or "",
+                    )
+                except Exception as cb_err:
+                    logging.warning("Tool progress callback error: %s", cb_err, exc_info=True)
         else:
             function_name, function_args, function_result, tool_duration, is_error, blocked = r
 
@@ -607,9 +627,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if not blocked and agent.tool_progress_callback:
                 try:
                     agent.tool_progress_callback(
-                        "tool.completed", function_name, None, None,
-                        duration=tool_duration, is_error=is_error,
+                        "tool.completed",
+                        function_name,
+                        None,
+                        None,
+                        duration=tool_duration,
+                        is_error=is_error,
                         result=function_result,
+                        tool_call_id=getattr(tc, "id", "") or "",
                     )
                 except Exception as cb_err:
                     logging.warning("Tool progress callback error: %s", cb_err, exc_info=True)
@@ -803,7 +828,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not _execution_blocked and agent.tool_progress_callback:
             try:
                 preview = _build_tool_preview(function_name, function_args)
-                agent.tool_progress_callback("tool.started", function_name, preview, function_args)
+                agent.tool_progress_callback(
+                    "tool.started",
+                    function_name,
+                    preview,
+                    function_args,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                )
             except Exception as cb_err:
                 logging.warning("Tool progress callback error: %s", cb_err, exc_info=True)
 
@@ -1157,9 +1188,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not _execution_blocked and agent.tool_progress_callback:
             try:
                 agent.tool_progress_callback(
-                    "tool.completed", function_name, None, None,
-                    duration=tool_duration, is_error=_is_error_result,
+                    "tool.completed",
+                    function_name,
+                    None,
+                    None,
+                    duration=tool_duration,
+                    is_error=_is_error_result,
                     result=function_result,
+                    tool_call_id=getattr(tool_call, "id", "") or "",
                 )
             except Exception as cb_err:
                 logging.warning("Tool progress callback error: %s", cb_err, exc_info=True)
