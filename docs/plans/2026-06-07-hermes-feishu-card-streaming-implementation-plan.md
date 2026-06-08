@@ -126,14 +126,13 @@ patch_dir="/Users/bytedance/Documents/运维/小A补丁/feishu-card-streaming-${
 mkdir -p "$patch_dir/commits"
 git -C "$worktree" rev-parse HEAD > "$patch_dir/BASE_COMMIT"
 git -C "$worktree" status --short > "$patch_dir/status-before.txt"
-printf '%s\n' "$patch_dir" > /Users/bytedance/Documents/运维/小A补丁/latest-feishu-card-streaming-dir
 ```
 
 Expected:
 
 - `BASE_COMMIT` contains exactly one commit hash.
 - `status-before.txt` is empty for a clean worktree.
-- `latest-feishu-card-streaming-dir` points to the new artifact directory.
+- `patch_dir` is the explicit artifact directory used in later export and apply commands.
 
 - [ ] **Step 3: Create patch export helper**
 
@@ -144,8 +143,11 @@ Create `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/scripts/e
 set -euo pipefail
 
 worktree=${WORKTREE:-/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/worktrees/hermes-agent}
-latest_file=/Users/bytedance/Documents/运维/小A补丁/latest-feishu-card-streaming-dir
-patch_dir=${PATCH_DIR:-$(cat "$latest_file")}
+if [[ -z "${PATCH_DIR:-}" ]]; then
+  echo "Set PATCH_DIR=/Users/bytedance/Documents/运维/小A补丁/<patch-stack-dir>" >&2
+  exit 2
+fi
+patch_dir=$PATCH_DIR
 base=${BASE_COMMIT:-$(cat "$patch_dir/BASE_COMMIT")}
 
 mkdir -p "$patch_dir/commits"
@@ -170,7 +172,11 @@ Create `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/scripts/a
 set -euo pipefail
 
 target=${1:-/Users/bytedance/.hermes/hermes-agent}
-patch_dir=${2:-$(cat /Users/bytedance/Documents/运维/小A补丁/latest-feishu-card-streaming-dir)}
+if [[ $# -lt 2 ]]; then
+  echo "Usage: $0 <target-hermes-repo> /Users/bytedance/Documents/运维/小A补丁/<patch-stack-dir>" >&2
+  exit 2
+fi
+patch_dir=$2
 
 git -C "$target" status --short
 echo "Applying patch stack from: $patch_dir"
@@ -1764,7 +1770,7 @@ Create or update `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming
 ## Patch Stack
 
 - Worktree: `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/worktrees/hermes-agent`
-- Patch directory: paste the path from `patches/latest-feishu-card-streaming-dir`.
+- Patch directory: paste the explicit path under `/Users/bytedance/Documents/运维/小A补丁/`.
 - Base commit: paste the content of `BASE_COMMIT`.
 - Export command: `/Users/bytedance/Documents/运维/hermes-feishu-card-streaming/scripts/export-patches.sh`
 - Split patches: `$patch_dir/commits/[0-9][0-9][0-9][0-9]-*.patch`
