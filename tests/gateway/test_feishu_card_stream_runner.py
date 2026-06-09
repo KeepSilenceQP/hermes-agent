@@ -688,3 +688,55 @@ def test_card_sink_delivery_suppresses_final_send_after_terminal_card_update():
 
     assert _should_use_feishu_card_streaming(platform_key="feishu", user_config=user_config) is True
     assert _card_sink_delivered_final(sink) is True
+
+
+# ── Native bot-at-forward config routing ─────────────────────────────────
+
+
+def test_native_bot_at_forwarding_config_defaults_disabled():
+    from gateway.run import _feishu_native_bot_at_forwarding_config
+
+    enabled, max_messages = _feishu_native_bot_at_forwarding_config({})
+
+    assert enabled is False
+    assert max_messages == 5
+
+
+def test_native_bot_at_forwarding_config_reads_feishu_display_platform():
+    from gateway.run import _feishu_native_bot_at_forwarding_config
+
+    enabled, max_messages = _feishu_native_bot_at_forwarding_config(
+        {
+            "display": {
+                "platforms": {
+                    "feishu": {
+                        "native_bot_at_forward": True,
+                        "native_bot_at_forward_max_messages": 3,
+                    }
+                }
+            }
+        }
+    )
+
+    assert enabled is True
+    assert max_messages == 3
+
+
+def test_native_bot_at_forwarding_config_clamps_invalid_cap_to_default():
+    from gateway.run import _feishu_native_bot_at_forwarding_config
+
+    enabled, max_messages = _feishu_native_bot_at_forwarding_config(
+        {
+            "display": {
+                "platforms": {
+                    "feishu": {
+                        "native_bot_at_forward": True,
+                        "native_bot_at_forward_max_messages": "not-a-number",
+                    }
+                }
+            }
+        }
+    )
+
+    assert enabled is True
+    assert max_messages == 5

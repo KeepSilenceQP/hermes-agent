@@ -4,11 +4,206 @@ import asyncio
 import json
 import logging
 import queue
+import re
 import threading
 from dataclasses import dataclass, field
 from typing import Any
 
 from gateway.stream_text_cleaner import StreamDisplayTextFilter, clean_stream_display_text
+
+_NATIVE_AT_TAG_RE = re.compile(
+    r"<at\s+user_id=([\"'])(ou_[A-Za-z0-9_-]+)\1\s*>(.*?)</at>",
+    re.DOTALL,
+)
+
+
+@dataclass(frozen=True)
+class NativeAtParagraph:
+    text: str
+    target_open_ids: tuple[str, ...]
+
+
+def _strip_fenced_code_blocks(text: str) -> str:
+    output_lines: list[str] = []
+    in_fence = False
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            output_lines.append(line)
+    return "\n".join(output_lines)
+
+
+def _split_paragraphs(text: str) -> list[str]:
+    paragraphs: list[str] = []
+    current: list[str] = []
+    for line in text.splitlines():
+        if line.strip():
+            current.append(line)
+            continue
+        if current:
+            paragraphs.append("\n".join(current).strip())
+            current = []
+    if current:
+        paragraphs.append("\n".join(current).strip())
+    return paragraphs
+
+
+def _normalize_native_at_paragraph(text: str) -> str:
+    return "\n".join(line.rstrip() for line in text.strip().splitlines())
+
+
+def render_native_at_as_human_text(text: str) -> str:
+    def _rewrite_one_paragraph(paragraph: str) -> str:
+        matches = list(_NATIVE_AT_TAG_RE.finditer(paragraph))
+        if not matches:
+            return paragraph
+        names = [m.group(3).strip() for m in matches]
+        cleaned = _NATIVE_AT_TAG_RE.sub("", paragraph).strip()
+        if not cleaned:
+            return f"对 {'、'.join(names)} 说"
+        return f"对 {'、'.join(names)} 说，{cleaned}"
+
+    in_fence = False
+    outside_lines: list[str] = []
+    output_blocks: list[str] = []
+
+    for line in (text or "").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            # Flush accumulated outside-fence lines as a paragraph block.
+            if outside_lines:
+                joined = "\n".join(outside_lines)
+                if _NATIVE_AT_TAG_RE.search(joined):
+                    output_blocks.append(_rewrite_one_paragraph(joined))
+                else:
+                    output_blocks.append(joined)
+                outside_lines = []
+            in_fence = not in_fence
+            output_blocks.append(line)
+            continue
+
+        if in_fence:
+            output_blocks.append(line)
+        elif not line.strip():
+            # Blank line — flush current paragraph.
+            if outside_lines:
+                joined = "\n".join(outside_lines)
+                if _NATIVE_AT_TAG_RE.search(joined):
+                    output_blocks.append(_rewrite_one_paragraph(joined))
+                else:
+                    output_blocks.append(joined)
+                outside_lines = []
+            output_blocks.append(line)
+        else:
+            outside_lines.append(line)
+
+    # Flush any trailing outside-fence lines.
+    if outside_lines:
+        joined = "\n".join(outside_lines)
+        if _NATIVE_AT_TAG_RE.search(joined):
+            output_blocks.append(_rewrite_one_paragraph(joined))
+        else:
+            output_blocks.append(joined)
+
+    return "\n".join(output_blocks)
+
+
+def extract_native_at_paragraphs(text: str, *, max_messages: int = 5) -> list[NativeAtParagraph]:
+    if max_messages <= 0:
+        return []
+
+    cleaned = _strip_fenced_code_blocks(text or "")
+    selected: list[NativeAtParagraph] = []
+    seen: set[str] = set()
+
+    for paragraph in _split_paragraphs(cleaned):
+        matches = list(_NATIVE_AT_TAG_RE.finditer(paragraph))
+        if not matches:
+            continue
+        normalized = _normalize_native_at_paragraph(paragraph)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        selected.append(
+            NativeAtParagraph(
+                text=paragraph,
+                target_open_ids=tuple(match.group(2) for match in matches),
+            )
+        )
+        if len(selected) >= max_messages:
+            remaining = sum(
+                1
+                for p in _split_paragraphs(cleaned)
+                if _NATIVE_AT_TAG_RE.search(p) and _normalize_native_at_paragraph(p) not in seen
+            )
+            if remaining > 0:
+                logger.warning(
+                    "feishu_native_bot_at_cap_reached max=%d skipped=%d",
+                    max_messages,
+                    remaining,
+                )
+            break
+
+    return selected
+
+
+class NativeBotAtForwarder:
+    def __init__(
+        self,
+        *,
+        adapter: Any,
+        chat_id: str,
+        metadata: dict[str, Any] | None = None,
+        reply_to: str | None = None,
+        enabled: bool = False,
+        max_messages: int = 5,
+    ):
+        self.adapter = adapter
+        self.chat_id = chat_id
+        self.metadata = metadata
+        self.reply_to = reply_to
+        self.enabled = enabled
+        self.max_messages = max(0, int(max_messages))
+
+    async def forward_from_final_text(self, text: str) -> int:
+        if not self.enabled or not text or not hasattr(self.adapter, "send_raw_text"):
+            return 0
+
+        paragraphs = extract_native_at_paragraphs(text, max_messages=self.max_messages)
+        sent = 0
+        for paragraph in paragraphs:
+            try:
+                result = await self.adapter.send_raw_text(
+                    self.chat_id,
+                    paragraph.text,
+                    metadata=self.metadata,
+                    reply_to=self.reply_to,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "feishu_native_bot_at_forward_failed chat_id=%s targets=%s error=%s",
+                    self.chat_id,
+                    ",".join(paragraph.target_open_ids),
+                    exc,
+                )
+                continue
+            if getattr(result, "success", False):
+                sent += 1
+                logger.info(
+                    "feishu_native_bot_at_forward_sent chat_id=%s targets=%s",
+                    self.chat_id,
+                    ",".join(paragraph.target_open_ids),
+                )
+            else:
+                logger.warning(
+                    "feishu_native_bot_at_forward_failed chat_id=%s targets=%s error=%s",
+                    self.chat_id,
+                    ",".join(paragraph.target_open_ids),
+                    getattr(result, "error", None) or "unknown error",
+                )
+        return sent
 
 
 @dataclass
@@ -151,6 +346,14 @@ class FeishuCardRunState:
         self.blocks.append(block)
         self.answer_block_id = block.block_id
         return block
+
+    def raw_answer_text(self) -> str:
+        if self.answer_block_id is None:
+            return ""
+        for block in self.blocks:
+            if block.block_id == self.answer_block_id and block.kind == "answer":
+                return block.content
+        return ""
 
     def start_tool(
         self,
@@ -328,7 +531,8 @@ class FeishuCardRunRenderer:
             elif block.kind == "tool" and block.tool is not None:
                 content_parts.append(self._tool_line(block.tool))
             elif block.kind == "answer" and block.content.strip():
-                content_parts.append(block.content)
+                rendered_block_content = render_native_at_as_human_text(block.content)
+                content_parts.append(rendered_block_content)
             elif block.kind == "footer" and block.content.strip():
                 if state.pending_model_segment.strip() and not pending_emitted:
                     content_parts.append(state.pending_model_segment)
@@ -384,6 +588,8 @@ class FeishuCardRunSink:
         update_interval_sec: float = 0.25,
         max_update_failures: int = 3,
         loop: asyncio.AbstractEventLoop | None = None,
+        native_bot_at_forward: bool = False,
+        native_bot_at_forward_max_messages: int = 5,
     ):
         self.adapter = adapter
         self.chat_id = chat_id
@@ -420,6 +626,14 @@ class FeishuCardRunSink:
         self._flush_lock = asyncio.Lock()
         self._sequence = 0
         self._update_failures = 0
+        self.native_at_forwarder = NativeBotAtForwarder(
+            adapter=self.adapter,
+            chat_id=self.chat_id,
+            metadata=self.metadata,
+            reply_to=self.reply_to,
+            enabled=native_bot_at_forward,
+            max_messages=native_bot_at_forward_max_messages,
+        )
 
     def _visible_text_chars(self) -> int:
         return (
@@ -793,6 +1007,14 @@ class FeishuCardRunSink:
                 return block.content
         return "(empty response)"
 
+    async def _forward_native_bot_at_from_raw_answer(self) -> None:
+        if self.final_response_sent:
+            return
+        raw_answer = self.state.raw_answer_text()
+        if not raw_answer:
+            return
+        await self.native_at_forwarder.forward_from_final_text(raw_answer)
+
     async def finalize(self, final_text: str) -> bool:
         await self.drain_pending_updates()
         self._flush_text_filter_pending()
@@ -805,6 +1027,7 @@ class FeishuCardRunSink:
                 return await self._send_fallback_text(fallback)
         self.state.finalize(final_text)
         if await self.flush():
+            await self._forward_native_bot_at_from_raw_answer()
             self._close()
             self.final_response_sent = True
             self.final_content_delivered = True
@@ -818,6 +1041,7 @@ class FeishuCardRunSink:
         self._flush_text_filter_pending()
         self.state.finalize(final_text)
         if self.update_handle and await self.flush():
+            await self._forward_native_bot_at_from_raw_answer()
             self._close()
             self.final_response_sent = True
             self.final_content_delivered = True

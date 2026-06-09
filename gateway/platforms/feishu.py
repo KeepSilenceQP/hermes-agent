@@ -1892,6 +1892,31 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def send_raw_text(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Feishu text message without markdown/post conversion."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="text",
+                payload=json.dumps({"text": text}, ensure_ascii=False),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "send raw text failed")
+        except Exception as exc:
+            logger.error("[Feishu] Raw text send error: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
     async def edit_message(
         self,
         chat_id: str,
