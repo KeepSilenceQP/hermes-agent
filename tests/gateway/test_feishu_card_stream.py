@@ -222,6 +222,7 @@ class _FakeFeishuCardAdapter:
         self.updated = []
         self.text_updated = []
         self.sent_text = []
+        self.raw_text = []
 
     async def create_card_stream_message(self, chat_id, card, metadata=None, reply_to=None):
         self.created.append((chat_id, card, metadata, reply_to))
@@ -238,6 +239,10 @@ class _FakeFeishuCardAdapter:
     async def send(self, chat_id, content, metadata=None, reply_to=None):
         self.sent_text.append((chat_id, content, metadata, reply_to))
         return SimpleNamespace(success=True, message_id="om_text_1")
+
+    async def send_raw_text(self, chat_id, text, metadata=None, reply_to=None):
+        self.raw_text.append((chat_id, text, metadata, reply_to))
+        return SimpleNamespace(success=True, message_id=f"om_raw_{len(self.raw_text)}")
 
 
 def test_sink_finalize_marks_final_delivery():
@@ -785,5 +790,414 @@ def test_sink_sequence_placeholder_tool_final_matches_user_visible_contract():
         assert "正在处理..." not in final_rendered
         assert final_rendered.count("final answer") == 1
         assert "command_execution" in final_rendered
+
+    asyncio.run(run())
+
+
+def test_native_at_extractor_selects_legal_paragraphs_in_order():
+    from gateway.platforms.feishu_card_stream import extract_native_at_paragraphs
+
+    text = (
+        "先说明背景。\n\n"
+        "<at user_id=\"ou_bot_a\">小A</at> 第一件事。\n\n"
+        "<at user_id=\"ou_bot_b\">小B</at> 第二件事。"
+    )
+
+    paragraphs = extract_native_at_paragraphs(text, max_messages=5)
+
+    assert [item.text for item in paragraphs] == [
+        "<at user_id=\"ou_bot_a\">小A</at> 第一件事。",
+        "<at user_id=\"ou_bot_b\">小B</at> 第二件事。",
+    ]
+    assert [item.target_open_ids for item in paragraphs] == [
+        ("ou_bot_a",),
+        ("ou_bot_b",),
+    ]
+
+
+def test_native_at_extractor_keeps_multiple_mentions_in_one_paragraph():
+    from gateway.platforms.feishu_card_stream import extract_native_at_paragraphs
+
+    text = (
+        "<at user_id=\"ou_bot_a\">小A</at> 和 "
+        "<at user_id=\"ou_bot_b\">小B</at> 请一起处理。"
+    )
+
+    paragraphs = extract_native_at_paragraphs(text, max_messages=5)
+
+    assert len(paragraphs) == 1
+    assert paragraphs[0].text == text
+    assert paragraphs[0].target_open_ids == ("ou_bot_a", "ou_bot_b")
+
+
+def test_native_at_extractor_dedupes_by_normalized_paragraph_not_target():
+    from gateway.platforms.feishu_card_stream import extract_native_at_paragraphs
+
+    first = "<at user_id=\"ou_bot_a\">小A</at> 处理构建失败。"
+    second = "<at user_id=\"ou_bot_a\">小A</at> 处理权限失败。"
+    text = f"{first}\n\n{first}\n\n{second}"
+
+    paragraphs = extract_native_at_paragraphs(text, max_messages=5)
+
+    assert [item.text for item in paragraphs] == [first, second]
+    assert [item.target_open_ids for item in paragraphs] == [
+        ("ou_bot_a",),
+        ("ou_bot_a",),
+    ]
+
+
+def test_native_at_extractor_ignores_code_blocks_and_illegal_aliases():
+    from gateway.platforms.feishu_card_stream import extract_native_at_paragraphs
+
+    text = (
+        "```text\n"
+        "<at user_id=\"ou_in_code\">小P</at> 示例。\n"
+        "```\n\n"
+        "<at id=\"ou_bad_id\">Bad</at> wrong field.\n\n"
+        "<at open_id=\"ou_bad_open\">Bad</at> wrong field.\n\n"
+        "<at user_id=\"cli_bad\">Bad</at> wrong value.\n\n"
+        "<at user_id=\"ou_good\">小P</at> real message."
+    )
+
+    paragraphs = extract_native_at_paragraphs(text, max_messages=5)
+
+    assert [item.text for item in paragraphs] == [
+        "<at user_id=\"ou_good\">小P</at> real message."
+    ]
+    assert paragraphs[0].target_open_ids == ("ou_good",)
+
+
+def test_native_at_extractor_applies_message_cap():
+    from gateway.platforms.feishu_card_stream import extract_native_at_paragraphs
+
+    text = "\n\n".join(
+        f"<at user_id=\"ou_bot_{index}\">Bot {index}</at> message {index}"
+        for index in range(4)
+    )
+
+    paragraphs = extract_native_at_paragraphs(text, max_messages=2)
+
+    assert [item.text for item in paragraphs] == [
+        "<at user_id=\"ou_bot_0\">Bot 0</at> message 0",
+        "<at user_id=\"ou_bot_1\">Bot 1</at> message 1",
+    ]
+
+
+def test_native_at_forwarder_sends_each_selected_paragraph():
+    import asyncio
+    from types import SimpleNamespace
+
+    from gateway.platforms.feishu_card_stream import NativeBotAtForwarder
+
+    class Adapter:
+        def __init__(self):
+            self.raw_texts = []
+
+        async def send_raw_text(self, chat_id, text, metadata=None, reply_to=None):
+            self.raw_texts.append((chat_id, text, metadata, reply_to))
+            return SimpleNamespace(success=True, message_id=f"om_{len(self.raw_texts)}")
+
+    async def run():
+        adapter = Adapter()
+        forwarder = NativeBotAtForwarder(
+            adapter=adapter,
+            chat_id="oc_1",
+            metadata={"thread_id": "omt_1"},
+            reply_to="om_parent",
+            enabled=True,
+            max_messages=5,
+        )
+        text = (
+            "<at user_id=\"ou_a\">小A</at> 第一件事。\n\n"
+            "<at user_id=\"ou_b\">小B</at> 第二件事。"
+        )
+
+        count = await forwarder.forward_from_final_text(text)
+
+        assert count == 2
+        assert adapter.raw_texts == [
+            ("oc_1", "<at user_id=\"ou_a\">小A</at> 第一件事。", {"thread_id": "omt_1"}, "om_parent"),
+            ("oc_1", "<at user_id=\"ou_b\">小B</at> 第二件事。", {"thread_id": "omt_1"}, "om_parent"),
+        ]
+
+    asyncio.run(run())
+
+
+def test_native_at_forwarder_disabled_sends_nothing():
+    import asyncio
+    from types import SimpleNamespace
+
+    from gateway.platforms.feishu_card_stream import NativeBotAtForwarder
+
+    class Adapter:
+        def __init__(self):
+            self.raw_texts = []
+
+        async def send_raw_text(self, chat_id, text, metadata=None, reply_to=None):
+            self.raw_texts.append(text)
+            return SimpleNamespace(success=True, message_id="om_1")
+
+    async def run():
+        adapter = Adapter()
+        forwarder = NativeBotAtForwarder(adapter=adapter, chat_id="oc_1", enabled=False)
+
+        count = await forwarder.forward_from_final_text("<at user_id=\"ou_a\">小A</at> hi")
+
+        assert count == 0
+        assert adapter.raw_texts == []
+
+    asyncio.run(run())
+
+
+def test_native_at_forwarder_failure_does_not_raise(caplog):
+    import asyncio
+    import logging
+    from types import SimpleNamespace
+
+    from gateway.platforms.feishu_card_stream import NativeBotAtForwarder
+
+    class Adapter:
+        async def send_raw_text(self, chat_id, text, metadata=None, reply_to=None):
+            return SimpleNamespace(success=False, error="send failed")
+
+    async def run():
+        forwarder = NativeBotAtForwarder(adapter=Adapter(), chat_id="oc_1", enabled=True)
+        return await forwarder.forward_from_final_text("<at user_id=\"ou_a\">小A</at> hi")
+
+    with caplog.at_level(logging.WARNING):
+        count = asyncio.run(run())
+
+    assert count == 0
+    assert "feishu_native_bot_at_forward_failed" in caplog.text
+    assert "ou_a" in caplog.text
+
+
+def test_raw_answer_text_returns_only_final_answer_block():
+    state = FeishuCardRunState()
+    state.append_commentary("<at user_id=\"ou_process\">Process</at> should not forward.")
+    state.set_footer("<at user_id=\"ou_footer\">Footer</at> should not forward.")
+
+    final = "<at user_id=\"ou_answer\">小P</at> 只转发最终正文。"
+    state.finalize(final)
+
+    assert state.raw_answer_text() == final
+
+
+def test_raw_answer_text_is_not_renderer_content():
+    state = FeishuCardRunState()
+    state.append_commentary("process text")
+    state.set_footer("footer text")
+    final = "<at user_id=\"ou_answer\">小P</at> 只转发最终正文。"
+    state.finalize(final)
+
+    rendered = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert state.raw_answer_text() == final
+    assert "process text" in rendered
+    assert "footer text" in rendered
+    assert rendered != state.raw_answer_text()
+
+
+def test_sink_forwards_native_at_after_successful_final_card_update():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(
+            adapter=adapter,
+            chat_id="oc_1",
+            metadata={"thread_id": "omt_1"},
+            reply_to="om_parent",
+            update_interval_sec=0,
+            native_bot_at_forward=True,
+        )
+
+        sink.on_commentary("<at user_id=\"ou_process\">Process</at> should not forward.")
+        await sink.drain_pending_updates()
+        final = "<at user_id=\"ou_answer\">小P</at> 请接手。"
+        delivered = await sink.finalize(final)
+
+        assert delivered is True
+        assert adapter.raw_text == [("oc_1", final, {"thread_id": "omt_1"}, "om_parent")]
+
+    asyncio.run(run())
+
+
+def test_sink_forwards_multiple_native_at_paragraphs_after_final_card_update():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(
+            adapter=adapter,
+            chat_id="oc_1",
+            update_interval_sec=0,
+            native_bot_at_forward=True,
+            native_bot_at_forward_max_messages=5,
+        )
+
+        first = "<at user_id=\"ou_a\">小A</at> 第一件事。"
+        second = "<at user_id=\"ou_a\">小A</at> 第二件事。"
+        delivered = await sink.finalize(f"{first}\n\n{second}")
+
+        assert delivered is True
+        assert [item[1] for item in adapter.raw_text] == [first, second]
+
+    asyncio.run(run())
+
+
+def test_sink_does_not_forward_native_at_when_feature_disabled():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(
+            adapter=adapter,
+            chat_id="oc_1",
+            update_interval_sec=0,
+            native_bot_at_forward=False,
+        )
+
+        delivered = await sink.finalize("<at user_id=\"ou_answer\">小P</at> 请接手。")
+
+        assert delivered is True
+        assert adapter.raw_text == []
+
+    asyncio.run(run())
+
+
+def test_sink_native_forward_failure_does_not_break_card_delivery():
+    from types import SimpleNamespace
+
+    class FailingRawAdapter(_FakeFeishuCardAdapter):
+        async def send_raw_text(self, chat_id, text, metadata=None, reply_to=None):
+            self.raw_text.append((chat_id, text, metadata, reply_to))
+            return SimpleNamespace(success=False, error="raw send failed")
+
+    async def run():
+        adapter = FailingRawAdapter()
+        sink = FeishuCardRunSink(
+            adapter=adapter,
+            chat_id="oc_1",
+            update_interval_sec=0,
+            native_bot_at_forward=True,
+        )
+
+        delivered = await sink.finalize("<at user_id=\"ou_answer\">小P</at> 请接手。")
+
+        assert delivered is True
+        assert sink.final_response_sent is True
+        assert adapter.updated
+        assert adapter.raw_text
+
+    asyncio.run(run())
+
+
+def test_card_display_rewrites_single_native_at_to_human_text():
+    from gateway.platforms.feishu_card_stream import render_native_at_as_human_text
+
+    rendered = render_native_at_as_human_text("<at user_id=\"ou_target\">小P</at> 你好")
+
+    assert rendered == "对 小P 说，你好"
+
+
+def test_card_display_rewrites_multiple_native_ats_to_human_text():
+    from gateway.platforms.feishu_card_stream import render_native_at_as_human_text
+
+    rendered = render_native_at_as_human_text(
+        "<at user_id=\"ou_a\">小P</at> <at user_id=\"ou_b\">小C</at> 请看"
+    )
+
+    assert rendered == "对 小P、小C 说，请看"
+
+
+def test_card_display_rewrite_ignores_incomplete_native_at():
+    from gateway.platforms.feishu_card_stream import render_native_at_as_human_text
+
+    partial = "<at user_id=\"ou_target\">小"
+
+    assert render_native_at_as_human_text(partial) == partial
+
+
+def test_raw_answer_survives_human_display_rewrite():
+    state = FeishuCardRunState()
+    raw = "<at user_id=\"ou_target\">小P</at> 你好"
+
+    state.finalize(raw)
+    rendered = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert state.raw_answer_text() == raw
+    assert "对 小P 说，你好" in rendered
+    assert "<at user_id=\"ou_target\">小P</at>" not in rendered
+
+
+def test_human_display_rewrite_does_not_apply_to_process_footer_or_tool_text():
+    state = FeishuCardRunState()
+    raw = "<at user_id=\"ou_target\">小P</at> 你好"
+    process = "<at user_id=\"ou_process\">Process</at> process text"
+    footer = "<at user_id=\"ou_footer\">Footer</at> footer text"
+
+    state.append_commentary(process)
+    state.set_footer(footer)
+    state.finalize(raw)
+
+    rendered = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "对 小P 说，你好" in rendered
+    assert process in rendered
+    assert footer in rendered
+    assert "对 Process 说" not in rendered
+    assert "对 Footer 说" not in rendered
+
+
+def test_card_display_rewrite_protects_fenced_code_blocks():
+    from gateway.platforms.feishu_card_stream import render_native_at_as_human_text
+
+    text = (
+        "```text\n"
+        "<at user_id=\"ou_example\">小P</at> 示例。\n"
+        "```\n\n"
+        "<at user_id=\"ou_real\">小C</at> 真实消息。"
+    )
+
+    rendered = render_native_at_as_human_text(text)
+
+    assert "<at user_id=\"ou_example\">小P</at> 示例。" in rendered
+    assert "对 小C 说，真实消息。" in rendered
+    assert "对 小P 说" not in rendered
+
+
+def test_native_at_extractor_logs_warning_when_cap_exceeded(caplog):
+    import logging
+    from gateway.platforms.feishu_card_stream import extract_native_at_paragraphs
+
+    text = "\n\n".join(
+        f"<at user_id=\"ou_bot_{i}\">Bot {i}</at> message {i}"
+        for i in range(10)
+    )
+
+    with caplog.at_level(logging.WARNING):
+        paragraphs = extract_native_at_paragraphs(text, max_messages=3)
+
+    assert len(paragraphs) == 3
+    assert "feishu_native_bot_at_cap_reached" in caplog.text
+    assert "max=3" in caplog.text
+    assert "skipped=" in caplog.text
+
+
+def test_sink_does_not_forward_twice_after_finalize():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(
+            adapter=adapter,
+            chat_id="oc_1",
+            update_interval_sec=0,
+            native_bot_at_forward=True,
+        )
+
+        delivered = await sink.finalize("<at user_id=\"ou_answer\">小P</at> 请接手。")
+        assert delivered is True
+
+        first_count = len(adapter.raw_text)
+        assert first_count == 1
+
+        # Call finalize a second time — should not forward again
+        delivered2 = await sink.finalize("<at user_id=\"ou_answer\">小P</at> 请接手。")
+        assert delivered2 is True
+        assert len(adapter.raw_text) == first_count
 
     asyncio.run(run())

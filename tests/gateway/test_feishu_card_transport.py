@@ -185,3 +185,42 @@ async def test_card_stream_text_updates_use_card_id_not_message_id():
     assert content_updates
     assert _field_value(content_updates[0], "card_id") == "card_1"
     assert _field_value(content_updates[0], "element_id") == "stream_md"
+
+
+@pytest.mark.asyncio
+async def test_send_raw_text_forces_text_payload_and_preserves_native_at(monkeypatch):
+    adapter = FeishuAdapter(PlatformConfig())
+    adapter._client = _FakeClient()
+    sent = {}
+
+    async def fake_send_with_retry(*, chat_id, msg_type, payload, reply_to=None, metadata=None):
+        sent["chat_id"] = chat_id
+        sent["msg_type"] = msg_type
+        sent["payload"] = payload
+        sent["reply_to"] = reply_to
+        sent["metadata"] = metadata
+        return SimpleNamespace(success=lambda: True, code=0, data=SimpleNamespace(message_id="om_raw"))
+
+    def fail_build_outbound_payload(content):
+        raise AssertionError("_build_outbound_payload must not be used for native at forwarding")
+
+    monkeypatch.setattr(adapter, "_feishu_send_with_retry", fake_send_with_retry)
+    monkeypatch.setattr(adapter, "_build_outbound_payload", fail_build_outbound_payload)
+
+    raw = "<at user_id=\"ou_target\">小P</at> 请接手。"
+    result = await adapter.send_raw_text(
+        "oc_1",
+        raw,
+        metadata={"thread_id": "omt_1"},
+        reply_to="om_parent",
+    )
+
+    assert result.success is True
+    assert result.message_id == "om_raw"
+    assert sent == {
+        "chat_id": "oc_1",
+        "msg_type": "text",
+        "payload": json.dumps({"text": raw}, ensure_ascii=False),
+        "reply_to": "om_parent",
+        "metadata": {"thread_id": "omt_1"},
+    }

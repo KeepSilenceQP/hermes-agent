@@ -1537,6 +1537,24 @@ def _should_use_feishu_card_streaming(*, platform_key: str, user_config: dict) -
     )
 
 
+def _feishu_native_bot_at_forwarding_config(user_config: dict) -> tuple[bool, int]:
+    display = user_config.get("display") if isinstance(user_config, dict) else {}
+    platforms = display.get("platforms") if isinstance(display, dict) else {}
+    feishu = platforms.get("feishu") if isinstance(platforms, dict) else {}
+    if not isinstance(feishu, dict):
+        return False, 5
+
+    enabled = feishu.get("native_bot_at_forward") is True
+    raw_max = feishu.get("native_bot_at_forward_max_messages", 5)
+    try:
+        max_messages = int(raw_max)
+    except (TypeError, ValueError):
+        max_messages = 5
+    if max_messages < 0:
+        max_messages = 0
+    return enabled, max_messages
+
+
 def _card_sink_delivered_final(sink: object | None) -> bool:
     """Return True when the card sink has already delivered the final response."""
     if sink is None:
@@ -17897,12 +17915,18 @@ class GatewayRunner:
                     from gateway.platforms.feishu_card_stream import FeishuCardRunSink
                     _feishu_adapter = self.adapters.get(Platform.FEISHU)
                     if _feishu_adapter:
+                        (
+                            _native_bot_at_forward,
+                            _native_bot_at_forward_max_messages,
+                        ) = _feishu_native_bot_at_forwarding_config(user_config)
                         feishu_card_sink_holder[0] = FeishuCardRunSink(
                             adapter=_feishu_adapter,
                             chat_id=source.chat_id,
                             metadata=_status_thread_metadata,
                             reply_to=event_message_id,
                             loop=_loop_for_step,
+                            native_bot_at_forward=_native_bot_at_forward,
+                            native_bot_at_forward_max_messages=_native_bot_at_forward_max_messages,
                         )
                         _emit_feishu_card_lifecycle(
                             feishu_card_sink_holder[0],
