@@ -3036,23 +3036,36 @@ def generate_launchd_plist() -> str:
         )
     )
 
-    # Build ProgramArguments array, including --profile when using a named profile
-    prog_args = [
-        "<string>/usr/bin/env</string>",
-        f"<string>{python_path}</string>",
-        "<string>-m</string>",
-        "<string>hermes_cli.main</string>",
-    ]
-    if profile_arg:
-        for part in profile_arg.split():
-            prog_args.append(f"<string>{part}</string>")
-    prog_args.extend(
-        [
-            "<string>gateway</string>",
-            "<string>run</string>",
-            "<string>--replace</string>",
+    # A machine-local wrapper can bridge launchd to a runtime stored on a
+    # removable volume. macOS LaunchAgents may be unable to traverse such a
+    # volume directly even though an interactive user session can. Named
+    # profiles keep the standard invocation because a single wrapper cannot
+    # safely infer which profile it should launch.
+    launchd_wrapper_value = os.environ.get("HERMES_LAUNCHD_WRAPPER", "").strip()
+    launchd_wrapper = Path(launchd_wrapper_value) if launchd_wrapper_value else None
+    if launchd_wrapper is not None and launchd_wrapper.is_file() and not profile_arg:
+        prog_args = [
+            "<string>/bin/zsh</string>",
+            f"<string>{launchd_wrapper}</string>",
         ]
-    )
+    else:
+        # Build ProgramArguments array, including --profile when using a named profile
+        prog_args = [
+            "<string>/usr/bin/env</string>",
+            f"<string>{python_path}</string>",
+            "<string>-m</string>",
+            "<string>hermes_cli.main</string>",
+        ]
+        if profile_arg:
+            for part in profile_arg.split():
+                prog_args.append(f"<string>{part}</string>")
+        prog_args.extend(
+            [
+                "<string>gateway</string>",
+                "<string>run</string>",
+                "<string>--replace</string>",
+            ]
+        )
     prog_args_xml = "\n        ".join(prog_args)
 
     return f"""<?xml version="1.0" encoding="UTF-8"?>

@@ -1661,6 +1661,33 @@ class TestProfileArg:
         assert "<array>\n        <string>/usr/bin/env</string>" in plist
         assert "<string>hermes_cli.main</string>" in plist
 
+    def test_launchd_plist_uses_installed_wrapper_when_present(self, tmp_path, monkeypatch):
+        """A local wrapper can bridge launchd to runtimes on removable volumes."""
+        hermes_home = tmp_path / ".hermes"
+        machine_home = tmp_path / "machine-home"
+        wrapper = (
+            machine_home
+            / "Library"
+            / "Application Support"
+            / "Hermes"
+            / "launchd"
+            / "hermes_gateway_launchd.sh"
+        )
+        hermes_home.mkdir()
+        wrapper.parent.mkdir(parents=True)
+        wrapper.write_text("#!/bin/zsh\n", encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_LAUNCHD_WRAPPER", str(wrapper))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(machine_home)))
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<array>\n        <string>/bin/zsh</string>" in plist
+        assert f"<string>{wrapper}</string>" in plist
+        assert "<string>hermes_cli.main</string>" not in plist
+
     def test_launchd_plist_writes_supervisor_logs_outside_documents(self, tmp_path, monkeypatch):
         """launchd opens stdout/stderr before exec; use Library logs, not HERMES_HOME."""
         hermes_home = tmp_path / "Documents" / "Hermes" / "home"
