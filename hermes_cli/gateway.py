@@ -4516,11 +4516,16 @@ def _running_under_gateway_supervisor() -> bool:
         marker ``gateway/run.py`` already uses to pick the restart path).
       - launchd sets ``XPC_SERVICE_NAME`` to the job label for jobs it spawns;
         interactive shells inherit the sentinel ``"0"`` instead.
+      - launchd wrappers that cross an SSH boundary export
+        ``HERMES_GATEWAY_SUPERVISED_CHILD`` because SSH does not preserve the
+        launchd XPC environment.
       - the s6-overlay container longrun exports ``HERMES_S6_SUPERVISED_CHILD``.
     """
     if os.environ.get("INVOCATION_ID"):
         return True
     if os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
+        return True
+    if os.environ.get("HERMES_GATEWAY_SUPERVISED_CHILD"):
         return True
     xpc_service = os.environ.get("XPC_SERVICE_NAME", "")
     if xpc_service and xpc_service != "0":

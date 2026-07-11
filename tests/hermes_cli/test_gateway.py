@@ -119,6 +119,7 @@ def _clear_supervisor_markers(monkeypatch):
     """Make ``_running_under_gateway_supervisor()`` report a plain shell."""
     monkeypatch.delenv("INVOCATION_ID", raising=False)
     monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SUPERVISED_CHILD", raising=False)
     # Interactive macOS shells inherit XPC_SERVICE_NAME="0"; launchd jobs get
     # the real label. Default to the shell sentinel so the guard can fire.
     monkeypatch.setenv("XPC_SERVICE_NAME", "0")
@@ -293,6 +294,10 @@ def test_running_under_gateway_supervisor_markers(monkeypatch):
 
     monkeypatch.delenv("INVOCATION_ID", raising=False)
     monkeypatch.setenv("HERMES_S6_SUPERVISED_CHILD", "1")
+    assert gateway._running_under_gateway_supervisor() is True
+
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+    monkeypatch.setenv("HERMES_GATEWAY_SUPERVISED_CHILD", "1")
     assert gateway._running_under_gateway_supervisor() is True
 
 
