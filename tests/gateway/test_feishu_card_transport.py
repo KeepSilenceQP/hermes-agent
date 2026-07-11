@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.feishu import FeishuAdapter
+from plugins.platforms.feishu.adapter import FeishuAdapter
 
 
 class _FakeCardApi:
