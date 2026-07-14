@@ -233,6 +233,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     A single task is dispatched as a one-item background batch unit."""
     from unittest.mock import MagicMock, patch
     import tools.delegate_tool as dt
+    from tools.approval import reset_current_session_key, set_current_session_key
 
     parent = MagicMock()
     parent._delegate_depth = 0
@@ -263,10 +264,16 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", slow_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
-    out = dt.delegate_task(
-        goal="the real task", context="ctx",
-        background=True, parent_agent=parent,
+    session_token = set_current_session_key(
+        "agent:main:feishu:dm:oc_async_test"
     )
+    try:
+        out = dt.delegate_task(
+            goal="the real task", context="ctx",
+            background=True, parent_agent=parent,
+        )
+    finally:
+        reset_current_session_key(session_token)
 
     import json
     parsed = json.loads(out)
@@ -289,6 +296,74 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     text = format_process_notification(evt)
     assert text is not None
     assert "the real task" in text
+
+
+def test_delegate_task_background_without_routable_session_runs_synchronously(monkeypatch):
+    """A detached result must not be queued when no session can receive it.
+
+    Unattended cron runs have no gateway session key.  Returning a background
+    handle in that context orphaned the completion event and left the parent
+    agent without the batch result needed to start dependent work.
+    """
+    import json
+    from unittest.mock import MagicMock
+
+    import tools.delegate_tool as dt
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.approval import reset_current_session_key, set_current_session_key
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = "cron_parent"
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        dt,
+        "_run_single_child",
+        lambda task_index, goal, **kw: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": f"done: {goal}",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        },
+    )
+
+    approval_token = set_current_session_key("")
+    session_tokens = set_session_vars(
+        source="cron",
+        session_key="",
+        async_delivery=True,
+    )
+    try:
+        out = dt.delegate_task(
+            tasks=[{"goal": "first"}, {"goal": "second"}],
+            background=True,
+            parent_agent=parent,
+        )
+    finally:
+        reset_current_session_key(approval_token)
+        clear_session_vars(session_tokens)
+
+    parsed = json.loads(out)
+    assert [item["summary"] for item in parsed["results"]] == [
+        "done: first",
+        "done: second",
+    ]
+    assert "no routable session" in parsed["note"]
+    assert process_registry.completion_queue.empty()
 
 
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
@@ -361,6 +436,7 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     import json
     from unittest.mock import MagicMock, patch
     import tools.delegate_tool as dt
+    from tools.approval import reset_current_session_key, set_current_session_key
 
     parent = MagicMock()
     parent._delegate_depth = 0
@@ -393,11 +469,17 @@ def test_delegate_task_background_batch_runs_as_one_unit(monkeypatch):
     monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
     monkeypatch.setattr(dt, "_run_single_child", _blocking_child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
-    out = dt.delegate_task(
-        tasks=[{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
-        background=True,
-        parent_agent=parent,
+    session_token = set_current_session_key(
+        "agent:main:feishu:dm:oc_batch_test"
     )
+    try:
+        out = dt.delegate_task(
+            tasks=[{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
+            background=True,
+            parent_agent=parent,
+        )
+    finally:
+        reset_current_session_key(session_token)
 
     parsed = json.loads(out)
     assert parsed["status"] == "dispatched"
@@ -516,6 +598,7 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
     kill the detached subagent mid-run."""
     from unittest.mock import MagicMock, patch
     import tools.delegate_tool as dt
+    from tools.approval import reset_current_session_key, set_current_session_key
 
     parent = MagicMock()
     parent._delegate_depth = 0
@@ -542,10 +625,16 @@ def test_delegate_task_background_detaches_child_from_parent(monkeypatch):
         "model": "m", "provider": None, "base_url": None, "api_key": None,
         "api_mode": None, "command": None, "args": None,
     }
-    with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
-         patch.object(dt, "_run_single_child", side_effect=slow_child), \
-         patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
-        out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+    session_token = set_current_session_key(
+        "agent:main:feishu:dm:oc_detach_test"
+    )
+    try:
+        with patch.object(dt, "_build_child_agent", side_effect=build_and_register), \
+             patch.object(dt, "_run_single_child", side_effect=slow_child), \
+             patch.object(dt, "_resolve_delegation_credentials", return_value=creds):
+            out = dt.delegate_task(goal="bg task", background=True, parent_agent=parent)
+    finally:
+        reset_current_session_key(session_token)
 
     import json
     assert json.loads(out)["status"] == "dispatched"
@@ -675,5 +764,3 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
-

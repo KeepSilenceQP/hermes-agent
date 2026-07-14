@@ -2825,6 +2825,19 @@ def delegate_task(
                     _session_key = _agent_session_id
         except Exception:
             _origin_ui_session_id = ""
+        if not _session_key and not _origin_ui_session_id:
+            logger.info(
+                "delegate_task: no routable session for async delivery; "
+                "running the batch synchronously instead."
+            )
+            _sync_result = _execute_and_aggregate()
+            if isinstance(_sync_result, dict):
+                _sync_result["note"] = (
+                    "background delegation has no routable session, so the "
+                    "subagent(s) ran SYNCHRONOUSLY and the result is included "
+                    "above."
+                )
+            return json.dumps(_sync_result, ensure_ascii=False)
         _parent_session_id = getattr(parent_agent, "session_id", None)
         _child_agents = [c for (_, _, c) in children]
 
