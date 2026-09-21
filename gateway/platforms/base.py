@@ -1561,6 +1561,7 @@ class SendResult:
     # Extra ids (send order) when a payload was split; ``message_id`` is then the LAST id so
     # later edits target the newest chunk.
     continuation_message_ids: tuple = ()
+    card_id: Optional[str] = None
     # SEND_ERROR_KINDS member (failures only) via :func:`classify_send_error`, so consumers
     # branch without substring-matching ``error``.
     error_kind: Optional[str] = None

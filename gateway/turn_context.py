@@ -69,6 +69,8 @@ class TurnContext:
     tools_holder: list = field(default_factory=lambda: [None])
     stream_consumer_holder: list = field(default_factory=lambda: [None])
     streaming_tts_consumer_holder: list = field(default_factory=lambda: [None])
+    feishu_card_sink_holder: list = field(default_factory=lambda: [None])
+    want_feishu_card_streaming_holder: list = field(default_factory=lambda: [False])
     # voice-ack wiring
     _voice_ack_fired: list = field(default_factory=lambda: [False])
     _voice_ack_guild: list = field(default_factory=lambda: [None])

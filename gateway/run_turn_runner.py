@@ -32,6 +32,11 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner  # noqa: F401
 
 # Log-record parity with the origin module.
+from gateway.feishu_card_runtime import (
+    _should_use_feishu_card_streaming, _feishu_native_bot_at_forwarding_config,
+    _emit_feishu_card_lifecycle, _route_feishu_card_tool_progress,
+)
+
 logger = logging.getLogger("gateway.run")
 
 # Exact refusals retained for older adapters/connectors without destination preflight.
@@ -115,6 +120,11 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
+        if ctx.want_feishu_card_streaming_holder[0] and _route_feishu_card_tool_progress(
+            ctx.feishu_card_sink_holder[0], event_type, tool_name, preview, args,
+            logger_obj=logger, **kwargs,
+        ):
+            return
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
@@ -907,7 +917,25 @@ class TurnRunner:
             scfg.enabled and scfg.transport != "off" if plat_streaming is None else bool(plat_streaming)
         )
         want_interim_messages = ctx.interim_assistant_messages_enabled
-        if want_stream_deltas or want_interim_messages:
+        card_sink = None
+        if _should_use_feishu_card_streaming(platform_key=platform_key, user_config=ctx.user_config):
+            from gateway.platforms.feishu_card_stream import FeishuCardRunSink
+            adapter = self._runner._adapter_for_source(ctx.source)
+            if adapter is not None:
+                enabled, limit = _feishu_native_bot_at_forwarding_config(ctx.user_config)
+                card_sink = FeishuCardRunSink(
+                    adapter=adapter, chat_id=ctx.source.chat_id, metadata=ctx._status_thread_metadata,
+                    reply_to=ctx.event_message_id, loop=ctx._loop_for_step,
+                    native_bot_at_forward=enabled, native_bot_at_forward_max_messages=limit,
+                )
+                ctx.feishu_card_sink_holder[0] = card_sink
+                ctx.want_feishu_card_streaming_holder[0] = True
+                _emit_feishu_card_lifecycle(card_sink, "已收到请求，正在准备上下文。", logger_obj=logger)
+                async def start_card():
+                    await card_sink.start()
+                    await card_sink.drain_pending_updates()
+                self._schedule(start_card(), "Feishu card sink start scheduling error")
+        if card_sink is None and (want_stream_deltas or want_interim_messages):
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 adapter = self._runner._adapter_for_source(ctx.source)
@@ -928,7 +956,7 @@ class TurnRunner:
             except Exception as err:
                 logger.debug("Could not set up stream consumer: %s", err)
         # Deltas tee to the stream consumer (when text streaming is on) and to streaming TTS.
-        delta_sinks = [sc for sc in ((stream_consumer if want_stream_deltas else None), stts) if sc is not None]
+        delta_sinks = [sc for sc in ((stream_consumer if want_stream_deltas else None), card_sink, stts) if sc is not None]
         stream_delta_cb = None
         if delta_sinks:
             def stream_delta_cb(text: Optional[str]) -> None:
@@ -945,12 +973,15 @@ class TurnRunner:
                 if not already_streamed:
                     stts.on_delta(text)
                     stts.on_delta(None)
+            if card_sink is not None:
+                card_sink.on_commentary(text, already_streamed=already_streamed)
+                return
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
             elif not already_streamed and ctx._status_adapter and str(text or "").strip():
                 self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
 
-        return stream_consumer, stream_delta_cb, interim_assistant_cb, want_interim_messages
+        return stream_consumer, stream_delta_cb, interim_assistant_cb, (want_interim_messages or card_sink is not None)
 
     # ── agent resolution (cache reuse vs fresh build) ───────────────────────────────────────
 

@@ -1784,7 +1784,7 @@ class GatewayTurnMixin:
             if response and adapter:
                 await self._deliver_media_from_response(response, event, adapter)
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
-            if _footer_line and adapter:
+            if _footer_line and adapter and not agent_result.get("runtime_footer_delivered"):
                 try:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:
@@ -3481,10 +3481,13 @@ class GatewayTurnMixin:
                 logger.debug("Stream consumer wait before queued message failed: %s", e)
         # Delivery uses the finalized task result (empty/failure normalization), not raw ``result``.
         _delivery_result = response if isinstance(response, dict) else (result or {})
+        from gateway.feishu_card_runtime import finalize_feishu_card
+        await finalize_feishu_card(_delivery_result, turn_ctx)
         first_response = _delivery_result.get("final_response", "")
         _already_streamed = self._run_agent_stream_confirmed_final_delivery(
             _sc, first_response, previewed=bool(_delivery_result.get("response_previewed")),
         )
+        _already_streamed = _already_streamed or bool(_delivery_result.get("already_sent"))
         # Same silence predicate as the normal path, else this branch leaks the literal marker.
         if self._is_intentional_silence(_delivery_result, first_response):
             logger.info(
@@ -3729,6 +3732,8 @@ class GatewayTurnMixin:
         flags reflect call success, not content, so reconcile against the recorded turn-final
         payload: a mismatch (False, incl. payload-less split delivery) never suppresses; None (no
         record) keeps legacy trust."""
+        from gateway.feishu_card_runtime import finalize_feishu_card
+        await finalize_feishu_card(response, turn_ctx)
         _sc, source, session_key = turn_ctx.stream_consumer_holder[0], turn_ctx.source, turn_ctx.session_key
         if not isinstance(response, dict) or response.get("failed"):
             return

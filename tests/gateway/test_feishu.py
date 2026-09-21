@@ -15,6 +15,12 @@ from unittest.mock import AsyncMock, Mock, patch
 
 from gateway.platforms.event import ProcessingOutcome
 
+import pytest
+
+@pytest.fixture(autouse=True)
+def _isolate_feishu_state_even_when_environment_is_cleared(monkeypatch, tmp_path):
+    monkeypatch.setattr("plugins.platforms.feishu.adapter.get_hermes_home", lambda: tmp_path)
+
 if TYPE_CHECKING:
     from plugins.platforms.feishu.adapter import FeishuAdapter
 
@@ -1176,6 +1182,10 @@ class TestAdapterBehavior(unittest.TestCase):
                 "all_proxy",
             )
         }
+        # macOS may expose a system proxy even when the conventional proxy
+        # environment variables are blank. Force this connect-time SSRF test
+        # onto the direct transport so it exercises DNS rebinding protection.
+        proxy_vars.update({"NO_PROXY": "*", "no_proxy": "*"})
         with (
             patch.dict(os.environ, proxy_vars, clear=False),
             patch("socket.getaddrinfo", side_effect=fake_getaddrinfo),
@@ -2549,5 +2559,4 @@ class TestChatLockEviction(unittest.TestCase):
 
         adapter = self._make_adapter()
         self.assertIsInstance(adapter._chat_locks, _collections.OrderedDict)
-
 

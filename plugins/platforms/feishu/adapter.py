@@ -120,6 +120,8 @@ _MARKDOWN_HINT_RE = re.compile(
     re.MULTILINE,
 )
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_BARE_URL_RE = re.compile(r"https?://[^\s<>\[\]，。；：！？、）\]}》〉”’\"']+")
+_TRAILING_URL_PUNCTUATION = ".,;:!?，。；：！？、）)]}》〉”’\"'"
 _MARKDOWN_FENCE_OPEN_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_FENCE_CLOSE_RE = re.compile(r"^```\s*$")
 _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
@@ -440,6 +442,72 @@ def _build_markdown_post_payload(content: str) -> str:
     return json.dumps({"zh_cn": {"content": rows}}, ensure_ascii=False)
 
 
+def _md_node(text: str) -> Dict[str, str]:
+    return {"tag": "md", "text": text}
+
+
+def _link_node(text: str, href: str) -> Dict[str, str]:
+    return {"tag": "a", "text": text, "href": href}
+
+
+def _append_md_node(nodes: List[Dict[str, str]], text: str) -> None:
+    if not text:
+        return
+    if nodes and nodes[-1].get("tag") == "md":
+        nodes[-1]["text"] = nodes[-1].get("text", "") + text
+        return
+    nodes.append(_md_node(text))
+
+
+def _split_trailing_url_punctuation(url: str) -> tuple[str, str]:
+    trailing = ""
+    while url and url[-1] in _TRAILING_URL_PUNCTUATION:
+        trailing = url[-1] + trailing
+        url = url[:-1]
+    return url, trailing
+
+
+def _build_inline_link_nodes(segment: str) -> List[Dict[str, str]]:
+    """Convert markdown links and bare URLs into Feishu post link nodes."""
+    if not segment:
+        return [_md_node("")]
+
+    nodes: List[Dict[str, str]] = []
+    cursor = 0
+
+    for markdown_match in _MARKDOWN_LINK_RE.finditer(segment):
+        prefix = segment[cursor : markdown_match.start()]
+        _append_bare_url_nodes(nodes, prefix)
+
+        label = markdown_match.group(1)
+        href = markdown_match.group(2).strip()
+        if href.startswith(("http://", "https://")):
+            nodes.append(_link_node(label, href))
+        else:
+            _append_md_node(nodes, markdown_match.group(0))
+        cursor = markdown_match.end()
+
+    _append_bare_url_nodes(nodes, segment[cursor:])
+    return nodes or [_md_node(segment)]
+
+
+def _append_bare_url_nodes(nodes: List[Dict[str, str]], text: str) -> None:
+    cursor = 0
+    for url_match in _BARE_URL_RE.finditer(text):
+        _append_md_node(nodes, text[cursor : url_match.start()])
+
+        raw_url = url_match.group(0)
+        href, trailing = _split_trailing_url_punctuation(raw_url)
+        if href:
+            nodes.append(_link_node(href, href))
+        else:
+            _append_md_node(nodes, raw_url)
+        _append_md_node(nodes, trailing)
+        cursor = url_match.end()
+
+    _append_md_node(nodes, text[cursor:])
+
+
 def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     """Build Feishu post rows, giving each fenced code block its own row.
 
@@ -449,17 +517,17 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
     if not content:
         return [[{"tag": "md", "text": ""}]]
     if "```" not in content:
-        return [[{"tag": "md", "text": content}]]
+        return [_build_inline_link_nodes(content)]
 
     rows: List[List[Dict[str, str]]] = []
     current: List[str] = []
     in_code_block = False
 
-    def _flush_current() -> None:
+    def _flush_current(*, linkify: bool = True) -> None:
         nonlocal current
         segment = "\n".join(current)
         if segment.strip():
-            rows.append([{"tag": "md", "text": segment}])
+            rows.append(_build_inline_link_nodes(segment) if linkify else [_md_node(segment)])
         current = []
 
     for raw_line in content.splitlines():
@@ -471,7 +539,7 @@ def _build_markdown_post_rows(content: str) -> List[List[Dict[str, str]]]:
         if is_fence:
             in_code_block = not in_code_block
             if not in_code_block:  # closing fence: the code block becomes its own row
-                _flush_current()
+                _flush_current(linkify=False)
     _flush_current()
     return rows or [[{"tag": "md", "text": content}]]
 
@@ -1254,6 +1322,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._media_batch_state = FeishuBatchState()
         self._pending_media_batches = self._media_batch_state.events
         self._pending_media_batch_tasks = self._media_batch_state.tasks
+        self._last_cardkit_create_error: str | None = None
         # Button-card state: id → {session_key, message_id, chat_id}
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
@@ -1613,6 +1682,31 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
+    async def send_raw_text(
+        self,
+        chat_id: str,
+        text: str,
+        *,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a Feishu text message without markdown/post conversion."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="text",
+                payload=json.dumps({"text": text}, ensure_ascii=False),
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "send raw text failed")
+        except Exception as exc:
+            logger.error("[Feishu] Raw text send error: %s", exc, exc_info=True)
+            return SendResult(success=False, error=str(exc))
+
     async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
         """Edit a previously sent Feishu text/post message."""
         if not self._client:
@@ -1640,6 +1734,258 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.error("[Feishu] Failed to edit message %s: %s", message_id, exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
+
+    # =========================================================================
+    # CardKit streaming card transport
+    # =========================================================================
+
+    async def create_card_stream_message(
+        self,
+        chat_id: str,
+        card: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        """Create a CardKit card and return its update_handle."""
+        try:
+            result = await self._create_card_stream_transport(
+                chat_id=chat_id,
+                card=card,
+                metadata=metadata,
+                reply_to=reply_to,
+            )
+            if result.success:
+                update_handle = (
+                    getattr(result, "update_handle", None)
+                    or getattr(result, "card_id", None)
+                )
+                setattr(result, "update_handle", update_handle)
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] card stream create failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def update_card_stream_message(
+        self, update_handle: str, card: Dict[str, Any], sequence: Optional[int] = None
+    ) -> SendResult:
+        """Update an existing CardKit card via the SDK."""
+        try:
+            ok = await self._update_card_stream_transport(update_handle, card, sequence=sequence)
+            if ok:
+                return SendResult(success=True)
+            return SendResult(success=False, error="card update failed")
+        except Exception as exc:
+            logger.warning("[Feishu] card stream update failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def update_card_stream_text(
+        self,
+        update_handle: str,
+        element_id: str,
+        content: str,
+        sequence: Optional[int] = None,
+    ) -> SendResult:
+        """Update a CardKit text element via the streaming text API."""
+        try:
+            ok = await self._update_card_stream_text_transport(
+                update_handle,
+                element_id,
+                content,
+                sequence=sequence,
+            )
+            if ok:
+                return SendResult(success=True)
+            return SendResult(success=False, error="card text update failed")
+        except Exception as exc:
+            logger.warning("[Feishu] card stream text update failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _create_card_stream_transport(
+        self, chat_id: str, card: Dict[str, Any], metadata=None, reply_to=None
+    ) -> SendResult:
+        """Create a CardKit-managed card and send a card_id reference to the chat.
+
+        Returns both ``message_id`` (visible Feishu message) and ``card_id``
+        (CardKit entity handle for subsequent streaming updates).
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        try:
+            card_id = await self._create_cardkit_card(card)
+            if not card_id:
+                error = self._last_cardkit_create_error or "cardkit.card.create returned no card_id"
+                return SendResult(success=False, error=error)
+
+            payload = json.dumps(
+                {"type": "card", "data": {"card_id": card_id}},
+                ensure_ascii=False,
+            )
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=payload,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
+            if not self._response_succeeded(response):
+                return self._response_error_result(response, default_message="card stream create failed")
+
+            message_id = self._extract_response_field(response, "message_id")
+            if not message_id:
+                return SendResult(success=False, error="card stream create: no message_id in response")
+
+            logger.info("[Feishu] card stream managed create: card_id=%s message_id=%s", card_id, message_id)
+            return SendResult(
+                success=True,
+                message_id=message_id,
+                card_id=card_id,
+                raw_response=response,
+            )
+        except ImportError:
+            logger.warning("[Feishu] cardkit SDK not available")
+            return SendResult(success=False, error="cardkit SDK not available")
+        except Exception as exc:
+            logger.warning("[Feishu] card create transport error: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _create_cardkit_card(self, card: Dict[str, Any]) -> str | None:
+        from lark_oapi.api.cardkit.v1 import (
+            CreateCardRequest,
+            CreateCardRequestBody,
+        )
+
+        self._last_cardkit_create_error = None
+        body = CreateCardRequestBody.builder()
+        body.type("card_json")
+        body.data(json.dumps(card, ensure_ascii=False))
+
+        request = CreateCardRequest.builder()
+        request.request_body(body.build())
+
+        card_api = self._client.cardkit.v1.card
+        built_request = request.build()
+        if hasattr(card_api, "acreate"):
+            response = await card_api.acreate(built_request)
+        else:
+            response = card_api.create(built_request)
+        ok = response.success() if hasattr(response, "success") else response.code == 0
+        if not ok:
+            code = getattr(response, "code", None)
+            msg = getattr(response, "msg", None) or getattr(response, "message", None)
+            self._last_cardkit_create_error = f"cardkit.card.create failed code={code} msg={msg or ''}".strip()
+            logger.warning("[Feishu] card create response failed: code=%s msg=%s", code, msg)
+            return None
+        card_id = getattr(response.data, "card_id", "") if response.data else ""
+        if not card_id:
+            self._last_cardkit_create_error = "cardkit.card.create returned no card_id"
+        return card_id
+
+    # Legacy fallback only. New card-stream messages are created as CardKit
+    # managed cards and already have card_id from cardkit.card.create.
+    async def _convert_message_id_to_card_id(self, message_id: str) -> str | None:
+        """Convert an IM message_id to a CardKit card_id via the id_convert API.
+
+        Returns the card_id on success, or None if conversion is not available.
+        """
+        try:
+            from lark_oapi.api.cardkit.v1 import (
+                IdConvertCardRequest,
+                IdConvertCardRequestBody,
+            )
+
+            body = IdConvertCardRequestBody.builder()
+            body.message_id(message_id)
+            request = IdConvertCardRequest.builder()
+            request.request_body(body.build())
+            response = await self._client.cardkit.v1.card.aid_convert(request.build())
+            if (hasattr(response, "success") and response.success()) or (
+                hasattr(response, "code") and response.code == 0
+            ):
+                card_id = getattr(response.data, "card_id", "") if response.data else ""
+                if card_id:
+                    return card_id
+            return None
+        except ImportError:
+            logger.debug("[Feishu] cardkit id_convert not available for legacy card lookup")
+            return None
+        except Exception as exc:
+            logger.warning("[Feishu] card_id conversion failed: %s", exc)
+            return None
+
+    async def _update_card_stream_transport(
+        self, update_handle: str, card: Dict[str, Any], sequence=None
+    ) -> bool:
+        """Update a CardKit card via the SDK async API."""
+        if not self._client:
+            return False
+        try:
+            from lark_oapi.api.cardkit.v1 import (
+                UpdateCardRequest,
+                UpdateCardRequestBody,
+            )
+            from lark_oapi.api.cardkit.v1.model.card import Card as CardKitCard
+
+            update_card = CardKitCard.builder()
+            update_card.type("card_json")
+            update_card.data(json.dumps(card))
+            update_body = UpdateCardRequestBody.builder()
+            update_body.card(update_card.build())
+            if sequence is not None:
+                update_body.sequence(sequence)
+            request = UpdateCardRequest.builder()
+            request.card_id(update_handle)
+            request.request_body(update_body.build())
+            response = await self._client.cardkit.v1.card.aupdate(request.build())
+            ok = response.success() if hasattr(response, "success") else response.code == 0
+            if not ok:
+                code = getattr(response, "code", None)
+                msg = getattr(response, "msg", None) or getattr(response, "message", None)
+                logger.warning("[Feishu] card update response failed: code=%s msg=%s", code, msg)
+            return ok
+        except ImportError:
+            logger.warning("[Feishu] cardkit SDK not available for update")
+            return False
+        except Exception as exc:
+            logger.warning("[Feishu] card update transport error: %s", exc)
+            return False
+
+    async def _update_card_stream_text_transport(
+        self,
+        update_handle: str,
+        element_id: str,
+        content: str,
+        sequence=None,
+    ) -> bool:
+        """Update a CardKit markdown/plain_text element using the streaming content API."""
+        if not self._client:
+            return False
+        try:
+            from lark_oapi.api.cardkit.v1 import (
+                ContentCardElementRequest,
+                ContentCardElementRequestBody,
+            )
+
+            body = ContentCardElementRequestBody.builder()
+            body.content(content)
+            if sequence is not None:
+                body.sequence(sequence)
+            request = ContentCardElementRequest.builder()
+            request.card_id(update_handle)
+            request.element_id(element_id)
+            request.request_body(body.build())
+            response = await self._client.cardkit.v1.card_element.acontent(request.build())
+            ok = response.success() if hasattr(response, "success") else response.code == 0
+            if not ok:
+                code = getattr(response, "code", None)
+                msg = getattr(response, "msg", None) or getattr(response, "message", None)
+                logger.warning("[Feishu] card text update response failed: code=%s msg=%s", code, msg)
+            return ok
+        except ImportError:
+            logger.warning("[Feishu] cardkit SDK not available for text update")
+            return False
+        except Exception as exc:
+            logger.warning("[Feishu] card text update transport error: %s", exc)
+            return False
 
     # Template attrs for the shared _format_exec_approval core. The card
     # header carries the title, so the text core starts at the code fence.

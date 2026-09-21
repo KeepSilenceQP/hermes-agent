@@ -393,6 +393,8 @@ def _dispatch_background(batch: _Batch) -> str:
 
     parent_agent = batch.parent_agent
     session_key, origin_ui_session_id = _resolve_async_session_key(parent_agent, batch.origin_ui_session_id)
+    if not session_key and not origin_ui_session_id:
+        return _run_sync_with_note(batch, "no_async")
     routing = dict(
         session_key=session_key, origin_ui_session_id=origin_ui_session_id, origin_session_id=wake_sid,
         parent_session_id=getattr(parent_agent, "session_id", None), max_async_children=_get_max_async_children(),

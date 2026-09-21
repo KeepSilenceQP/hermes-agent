@@ -1743,6 +1743,83 @@ class TestProfileArg:
             "--external-supervisor",
         ]
 
+    def test_launchd_plist_includes_real_user_home(self, tmp_path, monkeypatch):
+        """launchd starts with a sparse environment, so the plist must set HOME."""
+        hermes_home = tmp_path / ".hermes"
+        machine_home = tmp_path / "machine-home"
+        hermes_home.mkdir()
+        machine_home.mkdir()
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(machine_home)))
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<key>HOME</key>" in plist
+        assert f"<string>{machine_home}</string>" in plist
+
+    def test_launchd_plist_spawns_env_before_python(self, tmp_path, monkeypatch):
+        """Spawning /usr/bin/env avoids launchd xpcproxy denial on venv shims."""
+        hermes_home = tmp_path / ".hermes"
+        machine_home = tmp_path / "machine-home"
+        hermes_home.mkdir()
+        machine_home.mkdir()
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(machine_home)))
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<array>\n        <string>/usr/bin/env</string>" in plist
+        assert "<string>hermes_cli.main</string>" in plist
+
+    def test_launchd_plist_uses_installed_wrapper_when_present(self, tmp_path, monkeypatch):
+        """A local wrapper can bridge launchd to runtimes on removable volumes."""
+        hermes_home = tmp_path / ".hermes"
+        machine_home = tmp_path / "machine-home"
+        wrapper = (
+            machine_home
+            / "Library"
+            / "Application Support"
+            / "Hermes"
+            / "launchd"
+            / "hermes_gateway_launchd.sh"
+        )
+        hermes_home.mkdir()
+        wrapper.parent.mkdir(parents=True)
+        wrapper.write_text("#!/bin/zsh\n", encoding="utf-8")
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("HERMES_LAUNCHD_WRAPPER", str(wrapper))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(machine_home)))
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        assert "<array>\n        <string>/bin/zsh</string>" in plist
+        assert f"<string>{wrapper}</string>" in plist
+        assert "<string>hermes_cli.main</string>" not in plist
+
+    def test_launchd_plist_writes_supervisor_logs_outside_documents(self, tmp_path, monkeypatch):
+        """launchd opens stdout/stderr before exec; use Library logs, not HERMES_HOME."""
+        hermes_home = tmp_path / "Documents" / "Hermes" / "home"
+        machine_home = tmp_path / "machine-home"
+        hermes_home.mkdir(parents=True)
+        machine_home.mkdir()
+
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(machine_home)))
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        expected_log_dir = machine_home / "Library" / "Logs" / "Hermes"
+        assert f"<string>{expected_log_dir}/gateway.log</string>" in plist
+        assert f"<string>{expected_log_dir}/gateway.error.log</string>" in plist
+        assert f"<string>{hermes_home}/logs/gateway.log</string>" not in plist
+
     def test_launchd_plist_path_uses_real_user_home_not_profile_home(self, tmp_path, monkeypatch):
         profile_dir = tmp_path / ".hermes" / "profiles" / "orcha"
         profile_dir.mkdir(parents=True)

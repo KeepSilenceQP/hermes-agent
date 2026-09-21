@@ -3809,11 +3809,23 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     _launchd_fallback_to_detached(f"{what} exit {exc.returncode}")
 
 
+def _launchd_user_home() -> Path:
+    """Return the real macOS user home for launchd artifacts.
+
+    Profile-mode Hermes often sets ``HOME`` to a profile-scoped directory, but
+    launchd user agents still live under the actual account home.
+    """
+    import pwd
+
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
+
+
 def generate_launchd_plist() -> str:
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
     working_dir = _stable_service_working_dir()
     hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
+    user_home = str(_launchd_user_home())
+    log_dir = get_hermes_home() / "logs" if _profile_arg(hermes_home) else _launchd_user_home() / "Library" / "Logs" / "Hermes"
     log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
     venv_dir = _service_venv_dir()
@@ -3824,10 +3836,13 @@ def generate_launchd_plist() -> str:
     sane_path = ":".join(dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p]))
 
     # ProgramArguments (incl. --profile); the stderr wrapper keeps launchd restart semantics while timestamping stderr.
-    prog_args_xml = "\n        ".join(
-        f"<string>{part}</string>"
-        for part in _timestamped_stderr_gateway_command(log_dir / "gateway.error.log", external_supervisor=True)
-    )
+    wrapper = os.environ.get("HERMES_LAUNCHD_WRAPPER", "").strip()
+    command = _timestamped_stderr_gateway_command(log_dir / "gateway.error.log", external_supervisor=True)
+    if not _profile_arg(hermes_home):
+        command.insert(0, "/usr/bin/env")
+    if wrapper and Path(wrapper).is_file() and not _profile_arg(hermes_home):
+        command = ["/bin/zsh", wrapper]
+    prog_args_xml = "\n        ".join(f"<string>{part}</string>" for part in command)
 
     # Persist the configured RLIMIT_NOFILE floor: launchd defaults to soft 256, and every plist
     # rewrite would otherwise strip a manual limit and reintroduce EMFILE crashes.
@@ -3867,6 +3882,8 @@ def generate_launchd_plist() -> str:
         <string>{sane_path}</string>
         <key>VIRTUAL_ENV</key>
         <string>{venv_dir}</string>
+        <key>HOME</key>
+        <string>{user_home}</string>
         <key>HERMES_HOME</key>
         <string>{hermes_home}</string>
         <key>HERMES_SUPERVISED_CHILD</key>

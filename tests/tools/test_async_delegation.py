@@ -648,6 +648,74 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert "the real task" in text
 
 
+def test_delegate_task_background_without_any_routable_session_runs_synchronously(
+    monkeypatch,
+):
+    """Never orphan a detached result when no session can claim it."""
+    import json
+    from unittest.mock import MagicMock
+
+    import tools.delegate_tool as dt
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools.approval_context import reset_current_session_key, set_current_session_key
+
+    parent = MagicMock()
+    parent._delegate_depth = 0
+    parent.session_id = ""
+    parent._interrupt_requested = False
+    parent._active_children = []
+    parent._active_children_lock = None
+    fake_child = MagicMock()
+    fake_child._delegate_role = "leaf"
+
+    creds = {
+        "model": "m", "provider": None, "base_url": None, "api_key": None,
+        "api_mode": None, "command": None, "args": None,
+    }
+    monkeypatch.setattr(dt, "_build_child_agent", lambda **kw: fake_child)
+    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr(
+        dt,
+        "_run_single_child",
+        lambda task_index, goal, **kw: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": f"done: {goal}",
+            "api_calls": 1,
+            "duration_seconds": 0.1,
+            "model": "m",
+            "exit_reason": "completed",
+        },
+    )
+
+    approval_token = set_current_session_key("")
+    session_tokens = set_session_vars(
+        source="cron",
+        session_key="",
+        async_delivery=True,
+    )
+    try:
+        out = dt.delegate_task(
+            tasks=[
+                {"goal": "complete first task"},
+                {"goal": "complete second task"},
+            ],
+            background=True,
+            parent_agent=parent,
+        )
+    finally:
+        reset_current_session_key(approval_token)
+        clear_session_vars(session_tokens)
+
+    parsed = json.loads(out)
+    assert [item["summary"] for item in parsed["results"]] == [
+        "done: complete first task",
+        "done: complete second task",
+    ]
+    assert "SYNCHRONOUSLY" in parsed["note"]
+    assert process_registry.completion_queue.empty()
+
+
 def test_delegate_task_background_uses_live_tui_agent_session_id(monkeypatch):
     """TUI async delegation must route to the live/compressed agent id.
 
@@ -785,7 +853,6 @@ def test_gateway_cli_origin_event_left_unrouted():
     evt = _make_async_evt(session_key="")
     runner._enrich_async_delegation_routing(evt)
     assert "platform" not in evt
-
 
 def test_single_task_truncation_banner_when_max_iterations():
     """A single async subagent that hit its iteration cap (exit_reason=

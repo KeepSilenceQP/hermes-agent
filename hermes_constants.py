@@ -13,6 +13,7 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 
 _profile_fallback_warned: bool = False
+_hermes_home_unset_warned: bool = False
 _UNSET = object()
 _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar("_HERMES_HOME_OVERRIDE", default=_UNSET)
 
@@ -105,6 +106,24 @@ def get_hermes_home() -> Path:
         return Path(override)
     if not os.environ.get("HERMES_HOME", "").strip():
         _warn_profile_fallback_once()
+        # The active-profile warning above is conditional.  Always emit a
+        # separate one-shot warning when HERMES_HOME is missing so launchd or
+        # another subprocess spawner cannot silently write to the default
+        # home after a migrated installation loses its environment.
+        global _hermes_home_unset_warned
+        if not _hermes_home_unset_warned:
+            _hermes_home_unset_warned = True
+            msg = (
+                "[HERMES_HOME unset] HERMES_HOME environment variable is not set. "
+                "Falling back to ~/.hermes. Any writes will land in the default home. "
+                "Export HERMES_HOME to the desired data directory if this is a "
+                "migrated installation."
+            )
+            try:
+                sys.stderr.write(msg + "\n")
+                sys.stderr.flush()
+            except Exception:
+                pass
     return get_process_hermes_home()
 
 
