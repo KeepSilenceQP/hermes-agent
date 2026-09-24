@@ -16,16 +16,12 @@ def test_renderer_streaming_card_contains_text_and_running_tool():
         {
             "tag": "markdown",
             "element_id": "stream_md",
-            "content": (
-                "I will inspect the repo.\n\n"
-                "> ⏳ **command_execution** — `rg card_streaming`\n\n"
-                "_calling tools_"
-            ),
+            "content": "I will inspect the repo.\n\n> ⏳ **Command** · `rg card_streaming`",
         }
     ]
     body = str(card["body"])
     assert "I will inspect the repo." in body
-    assert "command_execution" in body
+    assert "Command" in body
     assert "rg card_streaming" in body
     assert "⏳" in body
 
@@ -50,8 +46,8 @@ def test_tool_output_is_not_rendered():
     card = FeishuCardRunRenderer().render(state)
 
     assert "SECRET_OUTPUT_SHOULD_NOT_RENDER" not in str(card)
-    assert "command_execution" in str(card)
-    assert "✅" in str(card)
+    assert "Command" in str(card)
+    assert "✓" in str(card)
 
 
 def test_error_tool_output_keeps_every_line_inside_quote_block():
@@ -66,7 +62,9 @@ def test_error_tool_output_keeps_every_line_inside_quote_block():
         output='{\n"results": [\n{"error": "Payment Required"}\n]\n}',
     )
 
-    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    content = FeishuCardRunRenderer(tool_display="detailed").content(
+        state, include_running_status=False
+    )
 
     assert "❌ **web_extract**" in content
     assert "> **Output**" in content
@@ -75,6 +73,364 @@ def test_error_tool_output_keeps_every_line_inside_quote_block():
     assert '> "results": [' in content
     assert '> {"error": "Payment Required"}' in content
     assert "\n\"results\"" not in content
+
+
+def test_detailed_tool_error_redacts_secrets_without_hiding_context():
+    state = FeishuCardRunState()
+    token = state.start_tool(
+        tool_name="web_extract",
+        preview="https://example.com?token=sk-preview1234567890",
+    )
+    state.finish_tool(
+        token,
+        ok=False,
+        output='{"error": "api_key=sk-1234567890abcdef Payment Required"}',
+    )
+
+    content = FeishuCardRunRenderer(tool_display="detailed").content(
+        state,
+        include_running_status=False,
+    )
+
+    assert "sk-1234567890abcdef" not in content
+    assert "sk-preview1234567890" not in content
+    assert "api_key=***" in content
+    assert "Payment Required" in content
+    assert "**Output**" in content
+
+
+def test_compact_tool_display_shows_one_line_error_without_raw_output():
+    state = FeishuCardRunState()
+    token = state.start_tool(
+        tool_name="web_extract",
+        preview="https://example.com/very/long/path",
+    )
+    state.finish_tool(
+        token,
+        ok=False,
+        output='{\n"results": [\n{"error": "Payment Required"}\n]\n}',
+    )
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert content == "> ⚠ **Read web** · `Payment Required`"
+    assert '"results"' not in content
+    assert "**Output**" not in content
+
+
+def test_compact_tool_error_handles_deeply_nested_json_without_recursion_error():
+    state = FeishuCardRunState()
+    token = state.start_tool(tool_name="web_extract")
+    deeply_nested = '{"x":' * 1200 + '"boom"' + "}" * 1200
+    state.finish_tool(token, ok=False, output=deeply_nested)
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "Read web" in content
+    assert "Tool failed" in content
+
+
+def test_compact_tool_error_redacts_secrets_and_neutralizes_markup():
+    state = FeishuCardRunState()
+    token = state.start_tool(tool_name="web_extract")
+    state.finish_tool(
+        token,
+        ok=False,
+        output=(
+            '{"error": "api_key=sk-1234567890abcdef '
+            '<person id=ou_attacker>fake mention</person> **bold**"}'
+        ),
+    )
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "sk-1234567890abcdef" not in content
+    assert "<person" not in content
+    assert "</person>" not in content
+    assert "api_key=***" in content
+    assert content.count("`") == 2
+
+
+def test_compact_running_preview_redacts_secrets_and_neutralizes_markup():
+    state = FeishuCardRunState()
+    state.start_tool(
+        tool_name="terminal",
+        preview=(
+            "curl 'https://example.com?api_key=sk-1234567890abcdef' "
+            "<person id=ou_attacker>fake mention</person>"
+        ),
+    )
+
+    content = FeishuCardRunRenderer(tool_preview_length=200).content(
+        state,
+        include_running_status=False,
+    )
+
+    assert "sk-1234567890abcdef" not in content
+    assert "<person" not in content
+    assert "</person>" not in content
+    assert "api_key=***" in content
+
+
+def test_compact_tool_summary_shows_later_failure_over_older_running_tool():
+    state = FeishuCardRunState()
+    running = state.start_tool(tool_name="terminal", preview="long task")
+    failed = state.start_tool(tool_name="web_search")
+    state.finish_tool(failed, ok=False, output='{"error": "Latest failure"}')
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "Latest failure" in content
+    assert "+1 active" in content
+    assert "long task" not in content
+    assert state.tools[0].tool_key == running
+
+
+def test_compact_tool_summary_uses_completion_order_for_latest_status():
+    state = FeishuCardRunState()
+    first = state.start_tool(tool_name="web_search")
+    second = state.start_tool(tool_name="read_file")
+    state.finish_tool(second, ok=True)
+    state.finish_tool(first, ok=False, output='{"error": "Late failure"}')
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "Late failure" in content
+    assert "1 failed" not in content
+    assert "✓ 1 completed" in content
+
+
+def test_compact_tool_summary_surfaces_success_after_earlier_failure():
+    state = FeishuCardRunState()
+    failed = state.start_tool(tool_name="web_search")
+    retry = state.start_tool(tool_name="web_search")
+    state.finish_tool(failed, ok=False, output='{"error": "Temporary failure"}')
+    state.finish_tool(retry, ok=True)
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "✓ **1 tool completed**" in content
+    assert "Web search" in content
+    assert "⚠ 1 failed earlier" in content
+    assert "Temporary failure" not in content
+
+
+def test_compact_tool_summary_counts_multiple_failures_and_completions():
+    state = FeishuCardRunState()
+    first = state.start_tool(tool_name="web_search")
+    completed = state.start_tool(tool_name="read_file")
+    latest = state.start_tool(tool_name="web_extract")
+    state.finish_tool(first, ok=False, output='{"error": "Old failure"}')
+    state.finish_tool(completed, ok=True)
+    state.finish_tool(latest, ok=False, output='{"error": "Latest failure"}')
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "Latest failure" in content
+    assert "Old failure" not in content
+    assert "2 failed" in content
+    assert "✓ 1 completed" in content
+
+
+def test_compact_tool_display_groups_completed_tools_without_previews():
+    state = FeishuCardRunState()
+    first = state.start_tool(
+        tool_name="terminal", preview="pwd", args={"command": "pwd"}
+    )
+    second = state.start_tool(
+        tool_name="exec_command", preview="ls", args={"command": "ls"}
+    )
+    third = state.start_tool(
+        tool_name="web_search",
+        preview="CardKit streaming",
+        args={"query": "CardKit streaming"},
+    )
+    state.finish_tool(first, ok=True)
+    state.finish_tool(second, ok=True)
+    state.finish_tool(third, ok=True)
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert content == "> ✓ **3 tools** · Command ×2 · Web search"
+    assert "`pwd`" not in content
+    assert "`ls`" not in content
+    assert "CardKit streaming" not in content
+
+
+def test_compact_tool_summary_keeps_category_cap_after_earlier_failure():
+    state = FeishuCardRunState()
+    failed = state.start_tool(tool_name="web_search")
+    state.finish_tool(failed, ok=False, output='{"error": "Temporary failure"}')
+    names = [
+        "terminal",
+        "read_file",
+        "patch",
+        "web_extract",
+        "execute_code",
+        "search_files",
+    ]
+    for name in names:
+        token = state.start_tool(tool_name=name)
+        state.finish_tool(token, ok=True)
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "+2 more" in content
+    assert "Execute Code" not in content
+    assert "Search Files" not in content
+
+
+def test_compact_tool_display_limits_completed_tool_categories():
+    state = FeishuCardRunState()
+    tool_names = (
+        "terminal",
+        "web_search",
+        "read_file",
+        "patch",
+        "delegate_task",
+        "vision_analyze",
+    )
+    for tool_name in tool_names:
+        token = state.start_tool(tool_name=tool_name)
+        state.finish_tool(token, ok=True)
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert content == (
+        "> ✓ **6 tools** · Command · Web search · Read file · Edit file · +2 more"
+    )
+
+
+def test_new_progress_mode_reports_hidden_same_name_tool_as_active():
+    from gateway.platforms.feishu_card_stream import FeishuCardRunSink
+
+    sink = FeishuCardRunSink(
+        adapter=object(),
+        chat_id="oc_test",
+        tool_display="compact",
+        tool_progress_mode="new",
+    )
+    sink.on_tool_progress("tool.started", "terminal", "pwd", {}, tool_call_id="call-1")
+    sink.on_tool_progress("tool.completed", "terminal", "", {}, tool_call_id="call-1")
+    sink.on_tool_progress("tool.started", "terminal", "ls", {}, tool_call_id="call-2")
+    sink._drain_events()
+
+    content = sink.renderer.content(sink.state, include_running_status=False)
+
+    assert "+1 active" in content
+    assert sink.state.tools[1].visible is False
+    assert sink.state.tools[1].status == "running"
+
+
+def test_new_progress_mode_reports_hidden_incomplete_tool_in_final_summary():
+    from gateway.platforms.feishu_card_stream import FeishuCardRunSink
+
+    sink = FeishuCardRunSink(
+        adapter=object(),
+        chat_id="oc_test",
+        tool_display="compact",
+        tool_progress_mode="new",
+    )
+    sink.on_tool_progress("tool.started", "terminal", "pwd", {}, tool_call_id="call-1")
+    sink.on_tool_progress("tool.completed", "terminal", "", {}, tool_call_id="call-1")
+    sink.on_tool_progress("tool.started", "terminal", "ls", {}, tool_call_id="call-2")
+    sink._drain_events()
+    sink.state.finalize("final answer")
+
+    content = sink.renderer.content(sink.state, include_running_status=False)
+
+    assert "✓ **1 tool completed**" in content
+    assert "⚠ 1 unavailable" in content
+    assert sink.state.tools[1].visible is False
+    assert sink.state.tools[1].status == "incomplete"
+
+
+def test_new_progress_mode_counts_hidden_failed_same_name_tool():
+    from gateway.platforms.feishu_card_stream import FeishuCardRunSink
+
+    sink = FeishuCardRunSink(
+        adapter=object(),
+        chat_id="oc_test",
+        tool_display="compact",
+        tool_progress_mode="new",
+    )
+    sink.on_tool_progress("tool.started", "terminal", "pwd", {}, tool_call_id="call-1")
+    sink.on_tool_progress("tool.completed", "terminal", "", {}, tool_call_id="call-1")
+    sink.on_tool_progress("tool.started", "terminal", "ls", {}, tool_call_id="call-2")
+    sink.on_tool_progress(
+        "tool.completed",
+        "terminal",
+        "",
+        {},
+        tool_call_id="call-2",
+        failed=True,
+        output='{"error": "Hidden failure"}',
+    )
+    sink._drain_events()
+
+    content = sink.renderer.content(sink.state, include_running_status=False)
+
+    assert "⚠ 1 failed" in content
+    assert "failed earlier" not in content
+    assert sink.state.tools[1].visible is False
+    assert sink.state.tools[1].status == "error"
+
+
+def test_new_progress_mode_hides_consecutive_same_name_tools_but_keeps_state():
+    from gateway.platforms.feishu_card_stream import FeishuCardRunSink
+
+    sink = FeishuCardRunSink(
+        adapter=object(),
+        chat_id="oc_1",
+        tool_progress_mode="new",
+    )
+    starts = (
+        ("call-1", "terminal", "one"),
+        ("call-2", "terminal", "two"),
+        ("call-3", "web_search", "query"),
+        ("call-4", "terminal", "three"),
+    )
+    for tool_call_id, tool_name, preview in starts:
+        sink.on_tool_progress(
+            "tool.started",
+            tool_name=tool_name,
+            preview=preview,
+            tool_call_id=tool_call_id,
+        )
+    for tool_call_id, tool_name, _ in starts:
+        sink.on_tool_progress(
+            "tool.completed",
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+        )
+    sink._drain_events()
+
+    tools = [block.tool for block in sink.state.blocks if block.tool is not None]
+    content = sink.renderer.content(sink.state, include_running_status=False)
+
+    assert len(tools) == 4
+    assert content == "> ✓ **4 tools** · Command ×3 · Web search"
+
+
+def test_off_tool_display_hides_tool_details_but_keeps_generic_running_status():
+    state = FeishuCardRunState()
+    state.start_tool(tool_name="terminal", preview="cat secret.txt")
+
+    content = FeishuCardRunRenderer(tool_display="off").content(state)
+
+    assert content == "_working_"
+    assert "terminal" not in content
+    assert "cat secret.txt" not in content
+    assert "calling tools" not in content
+
+
+def test_sink_applies_tool_display_mode_to_renderer():
+    from gateway.platforms.feishu_card_stream import FeishuCardRunSink
+
+    sink = FeishuCardRunSink(adapter=object(), chat_id="oc_1", tool_display="off")
+    sink.state.start_tool(tool_name="terminal", preview="pwd")
+
+    assert sink.renderer.content(sink.state, include_running_status=False) == ""
 
 
 def test_repeated_same_name_tools_get_distinct_tokens():
@@ -163,7 +519,7 @@ def test_reducer_delta_tool_delta_final_has_one_answer_source():
     assert "draft part one" not in content
     assert "draft part two" not in content
     assert content.count("final answer") == 1
-    assert "command_execution" in content
+    assert "Command" in content
     assert "pwd" in content
 
 
@@ -175,12 +531,68 @@ def test_model_text_before_tool_commits_as_process_not_answer():
 
     content = FeishuCardRunRenderer().content(state, include_running_status=False)
     assert "我先查官方输出。" in content
-    assert "web_search" in content
+    assert "Web search" in content
     assert any(
         block.kind == "process" and "我先查官方输出。" in block.content
         for block in state.blocks
     )
     assert not any(block.kind == "answer" for block in state.blocks)
+
+
+def test_interim_callback_dedupes_shorter_prefix_of_pending_model_text():
+    state = FeishuCardRunState()
+    pending = "Downloading the report now. I will summarize it next."
+    interim = "Downloading the report now."
+
+    state.append_model_text(pending)
+    state.close_interim_segment(interim, already_streamed=False)
+    state.start_tool(tool_key="call-1", tool_name="terminal", preview="restart")
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert content.count("Downloading the report now.") == 1
+    assert pending in content
+
+
+def test_interim_callback_merges_suffix_prefix_overlap_once():
+    state = FeishuCardRunState()
+    pending = "Downloading the report now. I will"
+    interim = "I will summarize it next."
+    merged = "Downloading the report now. I will summarize it next."
+
+    state.append_model_text(pending)
+    state.close_interim_segment(interim, already_streamed=False)
+    state.start_tool(tool_key="call-1", tool_name="terminal", preview="restart")
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert content.count(merged) == 1
+    assert content.count("I will") == 1
+
+
+def test_interim_callback_preserves_nonmatching_pending_text_order():
+    state = FeishuCardRunState()
+    pending = "First streamed segment."
+    interim = "Second commentary segment."
+
+    state.append_model_text(pending)
+    state.close_interim_segment(interim, already_streamed=False)
+    state.start_tool(tool_key="call-1", tool_name="terminal", preview="restart")
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert content.count(pending) == 1
+    assert content.count(interim) == 1
+    assert content.index(pending) < content.index(interim)
+
+
+def test_non_streamed_interim_callback_dedupes_matching_pending_model_text():
+    state = FeishuCardRunState()
+    text = "我已经定位到原因，现在修复服务。"
+
+    state.append_model_text(text)
+    state.close_interim_segment(text, already_streamed=False)
+    state.start_tool(tool_key="call-1", tool_name="terminal", preview="restart")
+
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+    assert content.count(text) == 1
 
 
 def test_already_streamed_interim_segment_does_not_render_duplicate_commentary():
@@ -203,7 +615,7 @@ def test_final_answer_renders_after_tools_even_when_model_text_arrived_first():
 
     content = FeishuCardRunRenderer().content(state, include_running_status=False)
     assert content.count("结论：OpenAI 和 Anthropic 都在强化 Agent Memory。") == 1
-    assert content.index("web_search") < content.index(
+    assert content.index("Web search") < content.index(
         "结论：OpenAI 和 Anthropic 都在强化 Agent Memory。"
     )
 
@@ -479,7 +891,7 @@ def test_sink_flush_threadsafe_updates_tool_progress_before_finalize():
                 break
             await asyncio.sleep(0.05)
         assert adapter.text_updated
-        assert "command_execution" in adapter.text_updated[-1][2]
+        assert "Command" in adapter.text_updated[-1][2]
         assert "pwd" in adapter.text_updated[-1][2]
         assert sink.final_response_sent is False
 
@@ -515,7 +927,7 @@ def test_sink_worker_thread_process_event_updates_before_finalize():
 
         assert adapter.text_updated
         content = adapter.text_updated[-1][2]
-        assert "command_execution" in content
+        assert "Command" in content
         assert "pwd" in content
         assert "正在处理..." not in content
 
@@ -559,7 +971,7 @@ def test_sink_created_in_worker_thread_uses_explicit_loop_for_realtime_updates()
 
         assert adapter.text_updated
         content = adapter.text_updated[-1][2]
-        assert "command_execution" in content
+        assert "Command" in content
         assert "pwd" in content
         assert sink.final_response_sent is False
 
@@ -690,6 +1102,22 @@ def test_tool_progress_completion_without_key_is_logged_as_degraded(caplog):
     assert "feishu_card_tool_progress_missing_key" in caplog.text
 
 
+def test_compact_incomplete_summary_keeps_completed_and_failed_counts():
+    state = FeishuCardRunState()
+    completed = state.start_tool(tool_name="web_search")
+    state.finish_tool(completed, ok=True)
+    failed = state.start_tool(tool_name="read_file")
+    state.finish_tool(failed, ok=False, output='{"error": "Read failed"}')
+    state.start_tool(tool_name="terminal", preview="pending")
+
+    state.finalize("final answer")
+    content = FeishuCardRunRenderer().content(state, include_running_status=False)
+
+    assert "Status unavailable" in content
+    assert "✓ 1 completed" in content
+    assert "⚠ 1 failed" in content
+
+
 def test_sink_reduces_tool_event_queued_before_final():
     async def run():
         adapter = _FakeFeishuCardAdapter()
@@ -704,10 +1132,41 @@ def test_sink_reduces_tool_event_queued_before_final():
         assert adapter.updated
         final_card = adapter.updated[-1][1]
         final_content = final_card["body"]["elements"][0]["content"]
-        assert "command_execution" in final_content
+        assert "Command" in final_content
         assert "pwd" in final_content
+        assert "⏳" not in final_content
+        assert "active" not in final_content
+        assert "status unavailable" in final_content.lower()
+        assert sink.state.tools[0].status == "incomplete"
         assert "正在处理..." not in final_content
         assert final_content.count("final answer") == 1
+
+    asyncio.run(run())
+
+
+def test_sink_marks_running_tool_incomplete_when_turn_fails():
+    async def run():
+        adapter = _FakeFeishuCardAdapter()
+        sink = FeishuCardRunSink(
+            adapter=adapter, chat_id="oc_1", update_interval_sec=60
+        )
+
+        await sink.start("正在处理...")
+        sink.on_tool_progress(
+            "tool.started",
+            tool_name="terminal",
+            preview="pwd",
+            tool_call_id="call-1",
+        )
+
+        delivered = await sink.finish_failed("Agent failed")
+
+        assert delivered is True
+        final_card = adapter.updated[-1][1]
+        final_content = final_card["body"]["elements"][0]["content"]
+        assert "⏳" not in final_content
+        assert "status unavailable" in final_content.lower()
+        assert sink.state.tools[0].status == "incomplete"
 
     asyncio.run(run())
 
@@ -778,7 +1237,7 @@ def test_sink_sequence_placeholder_tool_final_matches_user_visible_contract():
         await sink.drain_pending_updates()
         tool_content = adapter.text_updated[-1][2]
         assert "正在处理..." not in tool_content
-        assert "command_execution" in tool_content
+        assert "Command" in tool_content
         assert "pwd" in tool_content
 
         delivered = await sink.finalize("final answer")
@@ -789,7 +1248,7 @@ def test_sink_sequence_placeholder_tool_final_matches_user_visible_contract():
         final_rendered = str(final_card)
         assert "正在处理..." not in final_rendered
         assert final_rendered.count("final answer") == 1
-        assert "command_execution" in final_rendered
+        assert "Command" in final_rendered
 
     asyncio.run(run())
 

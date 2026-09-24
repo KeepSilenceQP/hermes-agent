@@ -83,7 +83,12 @@ def _route_feishu_card_tool_progress(
     logger_obj=None,
     **kwargs,
 ) -> bool:
-    if sink is None:
+    if sink is None or event_type not in {
+        "tool.started",
+        "tool.completed",
+        "_thinking",
+        "reasoning.available",
+    }:
         return False
     try:
         sink.on_tool_progress(event_type, tool_name, preview, args, **kwargs)

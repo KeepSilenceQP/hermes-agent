@@ -9,6 +9,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent.redact import redact_sensitive_text
 from gateway.stream_text_cleaner import StreamDisplayTextFilter, clean_stream_display_text
 
 _NATIVE_AT_TAG_RE = re.compile(
@@ -221,6 +222,8 @@ class FeishuCardToolBlock:
     args: dict[str, Any] = field(default_factory=dict)
     output: str = ""
     status: str = "running"
+    visible: bool = True
+    event_order: int = 0
 
 
 @dataclass
@@ -241,6 +244,7 @@ class FeishuCardRunState:
     terminal: str = "running"
     _next_block_index: int = 0
     _next_tool_index: int = 0
+    _next_tool_event_order: int = 0
 
     @property
     def tools(self) -> list[FeishuCardToolBlock]:
@@ -285,10 +289,44 @@ class FeishuCardRunState:
         if cleaned:
             self.append_answer_text(cleaned)
 
-    def close_interim_segment(self, text: str = "", *, already_streamed: bool = False) -> None:
+    @staticmethod
+    def _merge_overlapping_segments(earlier: str, later: str) -> str | None:
+        min_overlap = max(4, min(len(earlier), len(later)) // 4)
+        for overlap in range(min(len(earlier), len(later)), min_overlap - 1, -1):
+            if earlier.endswith(later[:overlap]):
+                return f"{earlier}{later[overlap:]}"
+        return None
+
+    def close_interim_segment(
+        self, text: str = "", *, already_streamed: bool = False
+    ) -> None:
         if already_streamed:
             return
         cleaned = clean_stream_display_text(text or "")
+        pending = clean_stream_display_text(self.pending_model_segment or "")
+        merged = (
+            self._merge_overlapping_segments(pending, cleaned)
+            if pending and cleaned
+            else None
+        )
+        if merged:
+            self.pending_model_segment = ""
+            self.append_commentary(merged)
+            return
+        if (
+            cleaned
+            and pending
+            and (
+                cleaned in pending
+                or pending in cleaned
+                or self._is_duplicate_text(cleaned, pending)
+            )
+        ):
+            self.pending_model_segment = ""
+            self.append_commentary(cleaned if len(cleaned) >= len(pending) else pending)
+            return
+        if pending:
+            self._commit_pending_model_segment_as_process()
         if cleaned:
             self.append_commentary(cleaned)
 
@@ -363,17 +401,21 @@ class FeishuCardRunState:
         args: dict[str, Any] | None = None,
         tool_key: str | None = None,
         token: str | None = None,
+        visible: bool = True,
     ) -> str:
         key = str(tool_key or token or f"tool-{self._next_tool_index}")
         if tool_key is None and token is None:
             self._next_tool_index += 1
-        self._hide_placeholder()
+        if visible:
+            self._hide_placeholder()
         self._commit_pending_model_segment_as_process()
         tool = FeishuCardToolBlock(
             tool_key=key,
             tool_name=tool_name,
             preview=preview or "",
             args=args or {},
+            visible=visible,
+            event_order=self._advance_tool_event_order(),
         )
         self.blocks.append(
             FeishuCardRunBlock(
@@ -391,6 +433,7 @@ class FeishuCardRunState:
             tool = self.blocks[index].tool
             if tool is not None:
                 tool.status = "done" if ok else "error"
+                tool.event_order = self._advance_tool_event_order()
                 if output:
                     tool.output = output
                 return
@@ -399,6 +442,7 @@ class FeishuCardRunState:
             tool_name="unknown",
             status="done" if ok else "error",
             output=output or "",
+            event_order=self._advance_tool_event_order(),
         )
         self.blocks.append(
             FeishuCardRunBlock(
@@ -420,6 +464,7 @@ class FeishuCardRunState:
             tool = block.tool
             if tool and tool.tool_name == tool_name and tool.status == "running":
                 tool.status = "done" if ok else "error"
+                tool.event_order = self._advance_tool_event_order()
                 if output:
                     tool.output = output
                 return tool.tool_key
@@ -437,7 +482,19 @@ class FeishuCardRunState:
         else:
             self._commit_pending_model_segment_as_answer()
             self._move_answer_block_to_terminal_position()
+        self.mark_running_tools_incomplete()
         self.terminal = "done"
+
+    def mark_running_tools_incomplete(self) -> None:
+        for tool in self.tools:
+            if tool.status == "running":
+                tool.status = "incomplete"
+                tool.output = "Tool status unavailable"
+                tool.event_order = self._advance_tool_event_order()
+
+    def _advance_tool_event_order(self) -> int:
+        self._next_tool_event_order += 1
+        return self._next_tool_event_order
 
     def _move_answer_block_to_terminal_position(self) -> None:
         if self.answer_block_id is None:
@@ -490,6 +547,15 @@ class FeishuCardRunState:
 class FeishuCardRunRenderer:
     STREAM_ELEMENT_ID = "stream_md"
 
+    def __init__(
+        self,
+        *,
+        tool_display: str = "compact",
+        tool_preview_length: int = 40,
+    ) -> None:
+        self.tool_display = tool_display
+        self.tool_preview_length = max(4, int(tool_preview_length))
+
     @staticmethod
     def _tool_display_name(tool_name: str) -> str:
         if tool_name in {"terminal", "exec_command"}:
@@ -497,12 +563,194 @@ class FeishuCardRunRenderer:
         return tool_name
 
     @staticmethod
+    def _compact_tool_name(tool_name: str) -> str:
+        names = {
+            "terminal": "Command",
+            "exec_command": "Command",
+            "execute_code": "Code",
+            "web_search": "Web search",
+            "web_extract": "Read web",
+            "browser_exec": "Browser",
+            "read_file": "Read file",
+            "search_files": "Search files",
+            "write_file": "Write file",
+            "patch": "Edit file",
+            "delegate_task": "Sub-agent",
+        }
+        if tool_name in names:
+            return names[tool_name]
+        short_name = tool_name.rsplit("__", 1)[-1]
+        return short_name.replace("_", " ").strip().title() or "Tool"
+
+    @staticmethod
+    def _compact_safe_text(text: str) -> str:
+        safe = redact_sensitive_text(
+            " ".join(str(text or "").split()),
+            force=True,
+            redact_url_credentials=True,
+        )
+        return safe.replace("<", "‹").replace(">", "›").replace("`", "'")
+
+    @staticmethod
+    def _compact_error_message(text: str) -> str:
+        def _find_error(value: Any) -> str | None:
+            if isinstance(value, dict):
+                for key in ("error", "message", "detail"):
+                    candidate = value.get(key)
+                    if isinstance(candidate, str) and candidate.strip():
+                        return candidate.strip()
+                for candidate in value.values():
+                    found = _find_error(candidate)
+                    if found:
+                        return found
+            elif isinstance(value, list):
+                for candidate in value:
+                    found = _find_error(candidate)
+                    if found:
+                        return found
+            return None
+
+        stripped = text.strip()
+        if not stripped:
+            return "Tool failed"
+        try:
+            message = _find_error(json.loads(stripped))
+        except RecursionError:
+            message = "Tool failed"
+        except (TypeError, ValueError):
+            message = None
+        if not message:
+            message = next(
+                (
+                    line.strip()
+                    for line in stripped.splitlines()
+                    if line.strip() not in {"{", "}"}
+                ),
+                "Tool failed",
+            )
+        message = redact_sensitive_text(
+            " ".join(message.split()),
+            force=True,
+            redact_url_credentials=True,
+        )
+        message = message.replace("<", "‹").replace(">", "›").replace("`", "'")
+        return f"{message[:157].rstrip()}..." if len(message) > 160 else message
+
+    def _compact_tool_labels(self, tools: list[FeishuCardToolBlock]) -> list[str]:
+        counts: dict[str, int] = {}
+        for tool in tools:
+            name = self._compact_tool_name(tool.tool_name)
+            counts[name] = counts.get(name, 0) + 1
+        labels = [
+            f"{name} ×{count}" if count > 1 else name for name, count in counts.items()
+        ]
+        if len(labels) > 4:
+            hidden_count = len(labels) - 4
+            labels = [*labels[:4], f"+{hidden_count} more"]
+        return labels
+
+    def _compact_tool_summary(
+        self,
+        tools: list[FeishuCardToolBlock],
+        *,
+        aggregate_tools: list[FeishuCardToolBlock] | None = None,
+    ) -> str:
+        aggregates = aggregate_tools if aggregate_tools is not None else tools
+        running = [tool for tool in aggregates if tool.status == "running"]
+        completed = [tool for tool in aggregates if tool.status == "done"]
+        failed = [tool for tool in aggregates if tool.status == "error"]
+        incomplete = [tool for tool in aggregates if tool.status == "incomplete"]
+        active_count = len(running)
+        latest = max(tools, key=lambda tool: tool.event_order)
+
+        if latest.status == "running":
+            name = self._compact_tool_name(latest.tool_name)
+            preview = latest.preview or str(
+                latest.args.get("command") or latest.args.get("cmd") or ""
+            )
+            preview = self._compact_safe_text(preview)
+            if len(preview) > self.tool_preview_length:
+                prefix_length = self.tool_preview_length - 3
+                preview = f"{preview[:prefix_length].rstrip()}..."
+            suffix = f" · `{self._inline_code(preview)}`" if preview else ""
+            if active_count > 1:
+                suffix += f" · +{active_count - 1} active"
+            if completed:
+                suffix += f" · ✓ {len(completed)} done"
+            if failed:
+                suffix += f" · ⚠ {len(failed)} failed"
+            if incomplete:
+                suffix += f" · ⚠ {len(incomplete)} unavailable"
+            return f"> ⏳ **{name}**{suffix}"
+
+        if latest.status == "incomplete":
+            name = self._compact_tool_name(latest.tool_name)
+            preview = self._compact_safe_text(latest.preview)
+            suffix = f" · `{self._inline_code(preview)}`" if preview else ""
+            if completed:
+                suffix += f" · ✓ {len(completed)} completed"
+            if failed:
+                suffix += f" · ⚠ {len(failed)} failed"
+            if len(incomplete) > 1:
+                suffix += f" · +{len(incomplete) - 1} unavailable"
+            if active_count:
+                suffix += f" · +{active_count} active"
+            return f"> ⚠ **{name}** · `Status unavailable`{suffix}"
+
+        if latest.status == "done":
+            labels = self._compact_tool_labels(completed)
+            noun = "tool" if len(completed) == 1 else "tools"
+            if failed or incomplete:
+                status_suffix = ""
+                if failed:
+                    failed_when = (
+                        "failed earlier"
+                        if all(tool.event_order < latest.event_order for tool in failed)
+                        else "failed"
+                    )
+                    status_suffix += f" · ⚠ {len(failed)} {failed_when}"
+                if incomplete:
+                    status_suffix += f" · ⚠ {len(incomplete)} unavailable"
+                summary = (
+                    f"> ✓ **{len(completed)} {noun} completed** · "
+                    f"{' · '.join(labels)}{status_suffix}"
+                )
+            else:
+                summary = f"> ✓ **{len(completed)} {noun}** · {' · '.join(labels)}"
+            if active_count:
+                summary += f" · +{active_count} active"
+            return summary
+
+        name = self._compact_tool_name(latest.tool_name)
+        message = self._compact_error_message(latest.output)
+        status_counts: list[str] = []
+        if len(failed) > 1:
+            status_counts.append(f"{len(failed)} failed")
+        if completed:
+            status_counts.append(f"✓ {len(completed)} completed")
+        if active_count:
+            status_counts.append(f"+{active_count} active")
+        if incomplete:
+            status_counts.append(f"⚠ {len(incomplete)} unavailable")
+        suffix = f" · {' · '.join(status_counts)}" if status_counts else ""
+        return f"> ⚠ **{name}** · `{message}`{suffix}"
+
+    @staticmethod
     def _inline_code(text: str) -> str:
         return text.replace("`", "'")
 
     @staticmethod
-    def _tool_output(text: str) -> str:
-        text = text.strip()
+    def _safe_detailed_text(text: str) -> str:
+        safe = redact_sensitive_text(
+            str(text or ""),
+            force=True,
+            redact_url_credentials=True,
+        )
+        return safe.replace("<", "‹").replace(">", "›")
+
+    @classmethod
+    def _tool_output(cls, text: str) -> str:
+        text = cls._safe_detailed_text(text).strip()
         if not text:
             return ""
         if len(text) > 1200:
@@ -511,17 +759,26 @@ class FeishuCardRunRenderer:
         return f"\n> **Output**\n{quoted_lines}"
 
     def _tool_line(self, tool: FeishuCardToolBlock) -> str:
-        icon = "✅" if tool.status == "done" else ("❌" if tool.status == "error" else "⏳")
+        icon = {
+            "done": "✅",
+            "error": "❌",
+            "incomplete": "⚠",
+        }.get(tool.status, "⏳")
         name = self._tool_display_name(tool.tool_name)
         preview = tool.preview
         if not preview:
             preview = str(tool.args.get("command") or tool.args.get("cmd") or "")
+        preview = self._safe_detailed_text(preview)
         suffix = f" — `{self._inline_code(preview)}`" if preview else ""
         output = self._tool_output(tool.output) if tool.status == "error" else ""
         return f"> {icon} **{name}**{suffix}{output}"
 
     def content(self, state: FeishuCardRunState, *, include_running_status: bool = True) -> str:
         content_parts: list[str] = []
+        all_tools = [block.tool for block in state.blocks if block.tool is not None]
+        tools = [tool for tool in all_tools if tool.visible]
+        aggregate_tools = [tool for tool in all_tools if tool.tool_name != "clarify"]
+        compact_tools_emitted = False
         if state.placeholder and state.terminal == "running":
             content_parts.append(state.placeholder)
         pending_emitted = False
@@ -529,7 +786,18 @@ class FeishuCardRunRenderer:
             if block.kind == "process" and block.content.strip():
                 content_parts.append(block.content)
             elif block.kind == "tool" and block.tool is not None:
-                content_parts.append(self._tool_line(block.tool))
+                if not block.tool.visible:
+                    continue
+                if self.tool_display == "detailed":
+                    content_parts.append(self._tool_line(block.tool))
+                elif self.tool_display == "compact" and not compact_tools_emitted:
+                    content_parts.append(
+                        self._compact_tool_summary(
+                            tools,
+                            aggregate_tools=aggregate_tools,
+                        )
+                    )
+                    compact_tools_emitted = True
             elif block.kind == "answer" and block.content.strip():
                 rendered_block_content = render_native_at_as_human_text(block.content)
                 content_parts.append(rendered_block_content)
@@ -541,11 +809,14 @@ class FeishuCardRunRenderer:
         if state.pending_model_segment.strip() and not pending_emitted:
             content_parts.append(state.pending_model_segment)
         if include_running_status and state.terminal == "running":
-            has_running_tool = any(
-                block.tool is not None and block.tool.status == "running"
-                for block in state.blocks
-            )
-            content_parts.append("_calling tools_" if has_running_tool else "_outputting_")
+            has_running_tool = any(tool.status == "running" for tool in all_tools)
+            if self.tool_display == "off" and has_running_tool:
+                if not state.placeholder:
+                    content_parts.append("_working_")
+            elif self.tool_display != "compact" or not has_running_tool:
+                content_parts.append(
+                    "_calling tools_" if has_running_tool else "_outputting_"
+                )
         return "\n\n".join(content_parts)
 
     def render(self, state: FeishuCardRunState, *, include_running_status: bool = True) -> dict[str, Any]:
@@ -588,6 +859,9 @@ class FeishuCardRunSink:
         update_interval_sec: float = 0.25,
         max_update_failures: int = 3,
         loop: asyncio.AbstractEventLoop | None = None,
+        tool_display: str = "compact",
+        tool_progress_mode: str = "all",
+        tool_preview_length: int = 40,
         native_bot_at_forward: bool = False,
         native_bot_at_forward_max_messages: int = 5,
     ):
@@ -607,7 +881,12 @@ class FeishuCardRunSink:
             except RuntimeError:
                 self._loop = None  # ok: test context, drain called manually
         self.state = FeishuCardRunState()
-        self.renderer = FeishuCardRunRenderer()
+        self.renderer = FeishuCardRunRenderer(
+            tool_display=tool_display,
+            tool_preview_length=tool_preview_length,
+        )
+        self.tool_progress_mode = tool_progress_mode
+        self._last_visible_tool_name: str | None = None
         self.text_filter = StreamDisplayTextFilter()
         self.message_id: str | None = None
         self.update_handle: str | None = None
@@ -825,11 +1104,22 @@ class FeishuCardRunSink:
             or kwargs.get("id")
         )
         if event_type == "tool.started":
+            visible = (
+                self.tool_progress_mode not in {"off", "log"} and tool_name != "clarify"
+            )
+            if (
+                self.tool_progress_mode == "new"
+                and tool_name == self._last_visible_tool_name
+            ):
+                visible = False
+            if visible:
+                self._last_visible_tool_name = tool_name
             key = self.state.start_tool(
                 tool_name=tool_name,
                 preview=preview or "",
                 args=args,
                 tool_key=str(tool_key) if tool_key else None,
+                visible=visible,
             )
             logger.info(
                 "feishu_card_event_reduced event=tool_use tool=%s tool_key=%s preview_chars=%s",
@@ -1055,6 +1345,7 @@ class FeishuCardRunSink:
         self._flush_text_filter_pending()
         if error_text:
             self.state.append_commentary(clean_stream_display_text(error_text))
+        self.state.mark_running_tools_incomplete()
         self.state.terminal = "error"
         if self.update_handle and await self.flush():
             self._close()

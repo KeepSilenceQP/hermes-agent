@@ -12,6 +12,209 @@ def _feishu_card_streaming_baseline_config():
     }
 
 
+def test_gateway_passes_resolved_progress_mode_to_card_sink():
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from gateway.config import Platform
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    async def run():
+        adapter = SimpleNamespace(
+            create_card_stream_message=AsyncMock(
+                return_value=SimpleNamespace(success=True, message_id="m", card_id="c")
+            ),
+            update_card_stream_message=AsyncMock(
+                return_value=SimpleNamespace(success=True)
+            ),
+            send=AsyncMock(
+                return_value=SimpleNamespace(success=True, message_id="fallback")
+            ),
+        )
+        ctx = TurnContext()
+        ctx.source = SimpleNamespace(platform=Platform.FEISHU, chat_id="test")
+        ctx.user_config = _feishu_card_streaming_baseline_config()
+        ctx.progress_mode = "off"
+        ctx.resolve_display_setting = lambda *args: True
+        ctx._run_still_current = lambda: True
+        ctx._loop_for_step = asyncio.get_running_loop()
+        runner = TurnRunner(
+            SimpleNamespace(  # type: ignore[arg-type]
+                config=None,
+                _adapter_for_source=lambda source: adapter,
+            ),
+            ctx,
+        )
+
+        runner._setup_stream_consumer("feishu")
+        await asyncio.sleep(0)
+
+        sink = ctx.feishu_card_sink_holder[0]
+        assert sink is not None
+        assert sink.renderer.tool_display == "off"
+        assert sink.tool_progress_mode == "off"
+
+    asyncio.run(run())
+
+
+def test_gateway_passes_platform_tool_preview_length_to_card_sink():
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from gateway.config import Platform
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    async def run():
+        adapter = SimpleNamespace(
+            create_card_stream_message=AsyncMock(
+                return_value=SimpleNamespace(success=True, message_id="m", card_id="c")
+            ),
+            update_card_stream_message=AsyncMock(
+                return_value=SimpleNamespace(success=True)
+            ),
+            send=AsyncMock(
+                return_value=SimpleNamespace(success=True, message_id="fallback")
+            ),
+        )
+        ctx = TurnContext()
+        ctx.source = SimpleNamespace(platform=Platform.FEISHU, chat_id="test")
+        ctx.user_config = _feishu_card_streaming_baseline_config()
+        ctx.progress_mode = "all"
+        ctx.resolve_display_setting = lambda config, platform, key, default=None: (
+            12 if key == "tool_preview_length" else True
+        )
+        ctx._run_still_current = lambda: True
+        ctx._loop_for_step = asyncio.get_running_loop()
+        runner = TurnRunner(
+            SimpleNamespace(  # type: ignore[arg-type]
+                config=None,
+                _adapter_for_source=lambda source: adapter,
+            ),
+            ctx,
+        )
+
+        runner._setup_stream_consumer("feishu")
+        await asyncio.sleep(0)
+
+        sink = ctx.feishu_card_sink_holder[0]
+        assert sink is not None
+        assert sink.renderer.tool_preview_length == 12
+
+    asyncio.run(run())
+
+
+def test_feishu_card_log_mode_logs_without_rendering_tool_rows():
+    import asyncio
+    import queue
+    from unittest.mock import AsyncMock
+
+    from gateway.config import Platform
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    async def run():
+        adapter = SimpleNamespace(
+            create_card_stream_message=AsyncMock(
+                return_value=SimpleNamespace(success=True, message_id="m", card_id="c")
+            ),
+            update_card_stream_message=AsyncMock(
+                return_value=SimpleNamespace(success=True)
+            ),
+            send=AsyncMock(
+                return_value=SimpleNamespace(success=True, message_id="fallback")
+            ),
+        )
+        ctx = TurnContext()
+        ctx.source = SimpleNamespace(platform=Platform.FEISHU, chat_id="test")
+        ctx.user_config = _feishu_card_streaming_baseline_config()
+        ctx.progress_mode = "log"
+        ctx.log_queue = queue.Queue()
+        ctx.resolve_display_setting = lambda *args: True
+        ctx._run_still_current = lambda: True
+        ctx._loop_for_step = asyncio.get_running_loop()
+        runner = TurnRunner(
+            SimpleNamespace(  # type: ignore[arg-type]
+                config=None,
+                _adapter_for_source=lambda source: adapter,
+            ),
+            ctx,
+        )
+
+        runner._setup_stream_consumer("feishu")
+        runner.progress_callback(
+            "tool.started",
+            "terminal",
+            "pwd",
+            {"command": "pwd"},
+            tool_call_id="call-1",
+        )
+        sink = ctx.feishu_card_sink_holder[0]
+        await sink.drain_pending_updates()
+
+        assert "terminal" in ctx.log_queue.get_nowait()
+        content = sink.renderer.content(sink.state, include_running_status=False)
+        assert "Command" not in content
+        assert "pwd" not in content
+
+    asyncio.run(run())
+
+
+def test_feishu_card_hides_reasoning_when_thinking_progress_is_disabled():
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from gateway.config import Platform
+    from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
+
+    async def run():
+        adapter = SimpleNamespace(
+            create_card_stream_message=AsyncMock(
+                return_value=SimpleNamespace(success=True, message_id="m", card_id="c")
+            ),
+            update_card_stream_message=AsyncMock(
+                return_value=SimpleNamespace(success=True)
+            ),
+            send=AsyncMock(
+                return_value=SimpleNamespace(success=True, message_id="fallback")
+            ),
+        )
+        ctx = TurnContext()
+        ctx.source = SimpleNamespace(platform=Platform.FEISHU, chat_id="test")
+        ctx.user_config = _feishu_card_streaming_baseline_config()
+        ctx.progress_mode = "off"
+        ctx._thinking_enabled = False
+        ctx.resolve_display_setting = lambda *args: True
+        ctx._run_still_current = lambda: True
+        ctx._loop_for_step = asyncio.get_running_loop()
+        runner = TurnRunner(
+            SimpleNamespace(  # type: ignore[arg-type]
+                config=None,
+                _adapter_for_source=lambda source: adapter,
+            ),
+            ctx,
+        )
+
+        runner._setup_stream_consumer("feishu")
+        runner.progress_callback("_thinking", "PRIVATE_REASONING", "", {})
+        runner.progress_callback(
+            "reasoning.available",
+            "reasoning",
+            "PRIVATE_REASONING_2",
+            {},
+        )
+        sink = ctx.feishu_card_sink_holder[0]
+        await sink.drain_pending_updates()
+
+        content = sink.renderer.content(sink.state, include_running_status=False)
+        assert "PRIVATE_REASONING" not in content
+        assert "PRIVATE_REASONING_2" not in content
+
+    asyncio.run(run())
+
+
 def test_card_streaming_flag_forces_stream_delta_capture():
     from gateway.feishu_card_runtime import _should_use_feishu_card_streaming
 
@@ -184,6 +387,31 @@ def test_route_feishu_card_tool_progress_calls_sink():
         ("tool.started", "terminal", "pwd", {"command": "pwd"}, {})
     ]
     assert sink.flushes == 1
+
+
+def test_route_feishu_card_tool_progress_ignores_unsupported_event():
+    from gateway.feishu_card_runtime import _route_feishu_card_tool_progress
+
+    class Sink:
+        def __init__(self):
+            self.calls = []
+
+        def on_tool_progress(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    sink = Sink()
+
+    assert (
+        _route_feishu_card_tool_progress(
+            sink,
+            "subagent.complete",
+            "delegate_task",
+            "failed",
+            {},
+        )
+        is False
+    )
+    assert sink.calls == []
 
 
 def test_route_feishu_card_tool_progress_handles_sink_error(caplog):
@@ -471,7 +699,7 @@ def test_card_sink_callback_routing_tool_progress():
 
         # Card was created with tool state
         rendered = str(adapter.created[0])
-        assert "search" in rendered
+        assert "Search" in rendered
         assert "done" in rendered or "running" in rendered
 
         # Finalize
@@ -506,7 +734,12 @@ def test_card_sink_renders_tool_result_output_and_error_state():
 
     async def run():
         adapter = _Adapter()
-        sink = FeishuCardRunSink(adapter=adapter, chat_id="oc_test", update_interval_sec=0)
+        sink = FeishuCardRunSink(
+            adapter=adapter,
+            chat_id="oc_test",
+            update_interval_sec=0,
+            tool_display="detailed",
+        )
 
         sink.on_tool_progress("tool.started", tool_name="terminal", preview="ls")
         sink.on_tool_progress(

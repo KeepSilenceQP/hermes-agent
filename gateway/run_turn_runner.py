@@ -33,7 +33,8 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 from gateway.feishu_card_runtime import (
-    _should_use_feishu_card_streaming, _feishu_native_bot_at_forwarding_config,
+    _should_use_feishu_card_streaming,
+    _feishu_native_bot_at_forwarding_config,
     _emit_feishu_card_lifecycle, _route_feishu_card_tool_progress,
 )
 
@@ -120,15 +121,16 @@ class TurnRunner:
     def progress_callback(self, event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
         """Callback invoked by agent on tool lifecycle events."""
         ctx = self._ctx
-        if ctx.want_feishu_card_streaming_holder[0] and _route_feishu_card_tool_progress(
-            ctx.feishu_card_sink_holder[0], event_type, tool_name, preview, args,
-            logger_obj=logger, **kwargs,
-        ):
-            return
         # Failed subagent → one clean user-facing notice, handled FIRST, before every progress-queue
         # gate: platforms with tool_progress off must still hear about a dead delegation.
         if event_type == "subagent.complete":
             self._progress_subagent_notice(preview, kwargs)
+            return
+        is_reasoning_event = (
+            event_type in {"_thinking", "reasoning.available"}
+            or tool_name == "_thinking"
+        )
+        if is_reasoning_event and not ctx._thinking_enabled:
             return
         self._progress_live_status(event_type, tool_name, args)
         # "log" mode: append tool.started lines to the log queue, silent in chat. Handled before
@@ -137,6 +139,18 @@ class TurnRunner:
             ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             preview_str = f' "{preview}"' if preview else ""
             ctx.log_queue.put(f"{ts}  {tool_name}:{preview_str}".rstrip())
+        if ctx.want_feishu_card_streaming_holder[
+            0
+        ] and _route_feishu_card_tool_progress(
+            ctx.feishu_card_sink_holder[0],
+            event_type,
+            tool_name,
+            preview,
+            args,
+            logger_obj=logger,
+            **kwargs,
+        ):
+            return
         if not ctx.progress_queue or not ctx._run_still_current():
             return
         if event_type == "tool.completed" and not ctx.long_tool_hint_fired[0]:
@@ -923,9 +937,36 @@ class TurnRunner:
             adapter = self._runner._adapter_for_source(ctx.source)
             if adapter is not None:
                 enabled, limit = _feishu_native_bot_at_forwarding_config(ctx.user_config)
+                try:
+                    tool_preview_length = int(
+                        ctx.resolve_display_setting(
+                            ctx.user_config,
+                            platform_key,
+                            "tool_preview_length",
+                            0,
+                        )
+                        or 0
+                    )
+                except (TypeError, ValueError):
+                    tool_preview_length = 0
+                if tool_preview_length <= 0:
+                    tool_preview_length = 40
+                tool_display = (
+                    "detailed"
+                    if ctx.progress_mode == "verbose"
+                    else "off"
+                    if ctx.progress_mode in {"off", "log"}
+                    else "compact"
+                )
                 card_sink = FeishuCardRunSink(
-                    adapter=adapter, chat_id=ctx.source.chat_id, metadata=ctx._status_thread_metadata,
-                    reply_to=ctx.event_message_id, loop=ctx._loop_for_step,
+                    adapter=adapter,
+                    chat_id=ctx.source.chat_id,
+                    metadata=ctx._status_thread_metadata,
+                    reply_to=ctx.event_message_id,
+                    loop=ctx._loop_for_step,
+                    tool_display=tool_display,
+                    tool_progress_mode=ctx.progress_mode,
+                    tool_preview_length=tool_preview_length,
                     native_bot_at_forward=enabled, native_bot_at_forward_max_messages=limit,
                 )
                 ctx.feishu_card_sink_holder[0] = card_sink
